@@ -402,19 +402,32 @@ _LANG_BY_EXTENSION = {
     ".go": "go",
 }
 
+# Extensions that are never source code — skip when detecting language
+_NON_CODE_EXTENSIONS = {
+    ".json", ".yml", ".yaml", ".toml", ".xml", ".cfg", ".ini", ".conf",
+    ".lock", ".md", ".rst", ".txt", ".csv", ".html", ".css", ".scss",
+    ".svg", ".png", ".jpg", ".gif", ".ico",
+}
 
-def _detect_language_from_patch(patch: str) -> str:
-    """Detect the primary programming language from file extensions in a patch."""
+
+def _detect_language_from_patch(patch: str) -> str | None:
+    """Detect the primary programming language from file extensions in a patch.
+
+    Returns None if no recognized source-code extensions are found (e.g. the
+    patch only touches config files like .json, .yml, .lock).
+    """
     file_paths = re.findall(r"^diff --git a/.+? b/(.+?)$", patch, re.MULTILINE)
     lang_counts: dict[str, int] = {}
     for fpath in file_paths:
         ext = Path(fpath).suffix.lower()
+        if ext in _NON_CODE_EXTENSIONS:
+            continue
         lang = _LANG_BY_EXTENSION.get(ext)
         if lang:
             lang_counts[lang] = lang_counts.get(lang, 0) + 1
 
     if not lang_counts:
-        return "python"  # default fallback
+        return None
     return max(lang_counts, key=lang_counts.get)  # type: ignore[arg-type]
 
 
@@ -498,6 +511,10 @@ def extract_candidate(
 
             # Determine language from candidate metadata or file extensions
             language = _detect_language_from_patch(solution_patch)
+            if language is None:
+                log.info("Skipping %s PR#%s — cannot determine language from patch (config-only files?)",
+                         repo_name, candidate["pr_number"])
+                return None
 
             # Temporarily apply the solution to read fixed source files
             target = head_sha or merge_sha

@@ -28,4 +28,5 @@ build/
 
 # System / machine-specific
 .DS_Store
-*.plist
+# Keep com.swe-infinite.plist tracked; ignore other plists
+# *.plist

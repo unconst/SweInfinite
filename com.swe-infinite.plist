@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Label must match the filename (without .plist) -->
+    <key>Label</key>
+    <string>com.swe-infinite</string>
+
+    <!-- Command to run — update the path to match your installation -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/const/SWEInfinite/.venv/bin/swe-infinite</string>
+    </array>
+
+    <!-- Working directory — update to match your clone location -->
+    <key>WorkingDirectory</key>
+    <string>/Users/const/SWEInfinite</string>
+
+    <!-- Auto-restart on crash -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Wait 30s before restarting after crash -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Environment variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Set your GitHub token here -->
+        <key>GITHUB_TOKEN</key>
+        <string>YOUR_TOKEN_HERE</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Redirect stdout/stderr to log files (in addition to rotating file logs) -->
+    <key>StandardOutPath</key>
+    <string>/Users/const/SWEInfinite/launchd_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/const/SWEInfinite/launchd_stderr.log</string>
+
+    <!-- Run at load (don't wait for calendar interval) -->
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

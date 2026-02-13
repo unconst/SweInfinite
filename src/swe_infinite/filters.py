@@ -1,6 +1,13 @@
 """
 Candidate filtering for the SWE-rebench pipeline.
 
+.. deprecated::
+    This module is **legacy** and not used by the current pipeline.
+    The active pipeline in ``pipeline.py`` uses the annotation-based
+    approach (``annotate_one`` / ``extract_one``) instead of the
+    ``run_filters`` function here.  Kept for backward compatibility
+    with older database schemas that have a ``candidates`` table.
+
 Links closed issues to merged PRs using GitHub keyword references
 (fixes #N, closes #N, resolves #N) found in PR title/body, then applies
 the paper's filtering criteria:

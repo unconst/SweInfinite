@@ -87,7 +87,7 @@ def _call_llm(prompt: str, max_tokens: int = 4096) -> str | None:
     # Fallback: Cursor agent CLI
     try:
         result = subprocess.run(
-            ["cursor", "--prompt", prompt],
+            ["agent", "-p", prompt, "--output-format", "text"],
             capture_output=True,
             text=True,
             timeout=120,

@@ -37,7 +37,6 @@ import shutil
 import signal
 import sqlite3
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -87,7 +86,7 @@ class FilterConfig:
     """
 
     # --- repo filters ---
-    min_stars: int = 0
+    min_stars: int = 5
     min_contributors: int = 0
     require_ci: bool = False
     require_tests: bool = False
@@ -103,7 +102,7 @@ class FilterConfig:
     max_patch_files: int = 15
     min_patch_lines: int = 3
     max_patch_lines: int = 1000
-    skip_patch_checks: bool = True
+    skip_patch_checks: bool = False
 
     # --- quality filters ---
     min_quality_score: int = 2
@@ -154,10 +153,6 @@ def _handle_signal(signum: int, frame: object) -> None:
     global _shutdown
     log.info("Shutting down after current task...")
     _shutdown = True
-
-
-signal.signal(signal.SIGINT, _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
 
 # ---------------------------------------------------------------------------
 # GitHub API helper (single PR enrichment)
@@ -1146,10 +1141,6 @@ def main() -> None:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--once", action="store_true", help="Produce one task then exit")
     parser.add_argument("--status", action="store_true", help="Print stats and exit")
-    parser.add_argument(
-        "--parallel", type=int, default=1, metavar="N",
-        help="Number of parallel workers for task processing (default: 1)",
-    )
 
     # --- Pipeline phase toggles ---
     phase_group = parser.add_argument_group("pipeline phases")
@@ -1189,8 +1180,8 @@ def main() -> None:
     # --- Repo filters ---
     repo_group = parser.add_argument_group("repo filters")
     repo_group.add_argument(
-        "--min-stars", type=int, default=0,
-        help="Minimum GitHub stars for repo quality gate (default: 0)",
+        "--min-stars", type=int, default=5,
+        help="Minimum GitHub stars for repo quality gate (default: 5)",
     )
     repo_group.add_argument(
         "--min-contributors", type=int, default=0,
@@ -1243,8 +1234,8 @@ def main() -> None:
         help="Maximum changed lines in solution patch (default: 1000)",
     )
     patch_group.add_argument(
-        "--patch-checks", action="store_true",
-        help="Enable patch complexity checks (file count, line count, config-only, comment-only)",
+        "--no-patch-checks", action="store_true",
+        help="Disable patch complexity checks (file count, line count, config-only, comment-only)",
     )
 
     # --- Quality filters ---
@@ -1257,6 +1248,11 @@ def main() -> None:
     args = parser.parse_args()
 
     _setup_logging()
+
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
     init_db(args.db)
 
     if args.status:
@@ -1281,7 +1277,7 @@ def main() -> None:
         max_patch_files=args.max_patch_files,
         min_patch_lines=args.min_patch_lines,
         max_patch_lines=args.max_patch_lines,
-        skip_patch_checks=not args.patch_checks,
+        skip_patch_checks=args.no_patch_checks,
         min_quality_score=args.min_quality_score,
         generate_tests=not args.no_generate_tests,
         skip_quality=not args.quality,
@@ -1294,7 +1290,7 @@ def main() -> None:
     )
 
     global _shutdown  # noqa: PLW0603
-    log.info("Starting SWE Infinite pipeline (pid=%d, workers=%d)", os.getpid(), args.parallel)
+    log.info("Starting SWE Infinite pipeline (pid=%d)", os.getpid())
     log.info("Filter config: %s", filter_config)
 
     # Seed the DB with some data

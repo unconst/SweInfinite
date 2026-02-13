@@ -142,7 +142,8 @@ def _build_url(dt: datetime) -> str:
 
 
 def hour_key(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d-%-H")
+    # Use f-string instead of %-H which is not portable across platforms
+    return f"{dt.strftime('%Y-%m-%d')}-{dt.hour}"
 
 
 def download_and_parse_hour(

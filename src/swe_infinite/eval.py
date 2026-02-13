@@ -342,11 +342,55 @@ def _get_python(repo_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run_tests(repo_dir: Path, test_files: list[str], timeout: int = 120) -> tuple[bool, str]:
-    """Run pytest on the specified test files.
+def _detect_language_from_test_files(test_files: list[str]) -> str:
+    """Detect the programming language from test file extensions."""
+    ext_map = {
+        ".py": "python",
+        ".ts": "typescript", ".tsx": "typescript",
+        ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
+        ".java": "java",
+        ".go": "go",
+    }
+    lang_counts: dict[str, int] = {}
+    for fpath in test_files:
+        ext = Path(fpath).suffix.lower()
+        lang = ext_map.get(ext)
+        if lang:
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+    if not lang_counts:
+        return "python"  # fallback
+    return max(lang_counts, key=lang_counts.get)  # type: ignore[arg-type]
+
+
+def run_tests(
+    repo_dir: Path,
+    test_files: list[str],
+    timeout: int = 120,
+    language: str | None = None,
+) -> tuple[bool, str]:
+    """Run tests on the specified test files using the appropriate test runner.
+
+    Detects the language from test file extensions and delegates to the
+    matching language handler (pytest for Python, jest for JS/TS, go test
+    for Go, mvn/gradle for Java).  Falls back to pytest for Python.
 
     Returns (passed: bool, output: str).
     """
+    if language is None:
+        language = _detect_language_from_test_files(test_files)
+
+    # For non-Python languages, use the language-specific handler
+    if language != "python":
+        try:
+            from .language_support import get_handler
+            handler = get_handler(language)
+            if handler:
+                result = handler.run_tests(repo_dir, test_files, timeout=timeout)
+                return result.passed, result.output
+        except Exception as exc:
+            log.warning("Language handler for %s failed: %s. Falling back to pytest.", language, exc)
+
+    # Python (or fallback): use pytest with the eval venv
     python = _get_python(repo_dir)
 
     # Filter to files that actually exist
