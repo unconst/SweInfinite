@@ -25,5 +25,6 @@ build/
 .mypy_cache/
 .ruff_cache/
 
-# OS
+# System / machine-specific
 .DS_Store
+*.plist
