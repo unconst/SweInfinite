@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -397,16 +398,93 @@ Steps:
 6. Do NOT modify test files"""
 
 
+@dataclass
+class AgentResult:
+    """Structured result from a Cursor agent invocation."""
+
+    success: bool
+    elapsed_seconds: float
+    output: str
+    token_count: int | None = None
+    tool_calls: int | None = None
+    model: str | None = None
+
+
+def _parse_agent_json_output(raw_output: str) -> tuple[str, int | None, int | None]:
+    """Parse structured JSON output from agent --output-format json.
+
+    The agent emits one JSON object per line (NDJSON).  Each object has a
+    ``type`` field.  We look for ``result`` objects and ``usage`` data.
+
+    Returns (text_output, token_count, tool_calls).
+    """
+    text_parts: list[str] = []
+    total_tokens: int = 0
+    total_tool_calls: int = 0
+    found_usage = False
+
+    for line in raw_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            # Not a JSON line — treat as plain text
+            text_parts.append(line)
+            continue
+
+        if not isinstance(obj, dict):
+            text_parts.append(line)
+            continue
+
+        msg_type = obj.get("type", "")
+
+        # Collect text content from assistant messages
+        if msg_type == "text" or "content" in obj:
+            content = obj.get("content") or obj.get("text") or ""
+            if content:
+                text_parts.append(str(content))
+
+        # Collect usage / token info
+        if "usage" in obj:
+            usage = obj["usage"]
+            if isinstance(usage, dict):
+                found_usage = True
+                total_tokens += usage.get("total_tokens", 0)
+                # Some formats use input_tokens + output_tokens
+                if not total_tokens:
+                    total_tokens += usage.get("input_tokens", 0)
+                    total_tokens += usage.get("output_tokens", 0)
+
+        # Count tool calls
+        if msg_type == "tool_call" or "tool" in obj:
+            total_tool_calls += 1
+        if "tool_calls" in obj:
+            calls = obj["tool_calls"]
+            if isinstance(calls, list):
+                total_tool_calls += len(calls)
+
+    return (
+        "\n".join(text_parts),
+        total_tokens if found_usage else None,
+        total_tool_calls if total_tool_calls > 0 else None,
+    )
+
+
 def invoke_agent(
     repo_dir: Path,
     problem_statement: str,
     test_files: list[str],
     timeout: int = 300,
     model: str | None = None,
-) -> tuple[bool, float, str]:
+) -> AgentResult:
     """Invoke the Cursor agent CLI to solve the task.
 
-    Returns (success: bool, elapsed_seconds: float, output: str).
+    Uses ``--output-format json`` to capture structured data including
+    token counts and tool-call counts when available.
+
+    Returns an AgentResult with success, timing, output, and metrics.
     """
     test_files_str = " ".join(test_files)
     prompt = AGENT_PROMPT_TEMPLATE.format(
@@ -415,7 +493,12 @@ def invoke_agent(
         test_files_str=test_files_str,
     )
 
-    cmd = ["agent", "-p", prompt, "--workspace", str(repo_dir)]
+    cmd = [
+        "agent", "-p", prompt,
+        "--output-format", "json",
+        "--force",
+        "--workspace", str(repo_dir),
+    ]
     if model:
         cmd.extend(["--model", model])
 
@@ -429,11 +512,29 @@ def invoke_agent(
             cwd=repo_dir,
         )
         elapsed = time.monotonic() - start
-        output = result.stdout + result.stderr
-        return result.returncode == 0, elapsed, output
+        raw_output = result.stdout + result.stderr
+
+        # Try to parse structured JSON output for metrics
+        text_output, token_count, tool_calls = _parse_agent_json_output(result.stdout)
+        if not text_output:
+            text_output = raw_output
+
+        return AgentResult(
+            success=result.returncode == 0,
+            elapsed_seconds=elapsed,
+            output=text_output,
+            token_count=token_count,
+            tool_calls=tool_calls,
+            model=model,
+        )
     except subprocess.TimeoutExpired:
         elapsed = time.monotonic() - start
-        return False, elapsed, f"Agent timed out after {timeout}s"
+        return AgentResult(
+            success=False,
+            elapsed_seconds=elapsed,
+            output=f"Agent timed out after {timeout}s",
+            model=model,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -535,12 +636,16 @@ def evaluate_task(
 
     # Invoke agent
     log.info("  Invoking agent (timeout=%ds)...", agent_timeout)
-    agent_ok, elapsed, agent_output = invoke_agent(
+    agent_result = invoke_agent(
         repo_dir, problem_statement, test_files, timeout=agent_timeout, model=model,
     )
+    elapsed = agent_result.elapsed_seconds
     result["agent_time_seconds"] = round(elapsed, 1)
+    result["token_count"] = agent_result.token_count
+    result["tool_calls"] = agent_result.tool_calls
+    result["model"] = agent_result.model
 
-    if not agent_ok and "timed out" in agent_output.lower():
+    if not agent_result.success and "timed out" in agent_result.output.lower():
         result["status"] = "timeout"
         result["error"] = f"Agent timed out after {agent_timeout}s"
         log.warning("  Agent timed out (%.1fs)", elapsed)
@@ -558,6 +663,69 @@ def evaluate_task(
         log.info("  UNRESOLVED — tests still fail (%.1fs)", elapsed)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Single-task evaluation (for pipeline integration)
+# ---------------------------------------------------------------------------
+
+
+def evaluate_new_task(
+    task: dict,
+    model: str = "opus-4.6",
+    agent_timeout: int = 300,
+    skip_install: bool = False,
+    cleanup: bool = True,
+) -> dict:
+    """Evaluate a single task and return an eval_result dict.
+
+    This is a lighter-weight entry point designed for pipeline integration.
+    It runs the full eval pipeline (setup, install, sanity, agent, retest)
+    and returns a dict suitable for embedding in the task JSON as ``eval_result``.
+
+    Returns:
+        dict with keys: status, model, agent_time_seconds, token_count,
+        tool_calls, sanity_check, evaluated_at, error.
+    """
+    eval_result: dict = {
+        "status": "error",
+        "model": model,
+        "agent_time_seconds": 0.0,
+        "token_count": None,
+        "tool_calls": None,
+        "sanity_check": False,
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "error": None,
+    }
+
+    instance_id = task.get("instance_id", "unknown")
+
+    try:
+        result = evaluate_task(
+            task,
+            agent_timeout=agent_timeout,
+            skip_install=skip_install,
+            model=model,
+        )
+
+        eval_result["status"] = result["status"]
+        eval_result["agent_time_seconds"] = result.get("agent_time_seconds", 0.0)
+        eval_result["token_count"] = result.get("token_count")
+        eval_result["tool_calls"] = result.get("tool_calls")
+        eval_result["sanity_check"] = result.get("sanity_check", False)
+        eval_result["error"] = result.get("error")
+        eval_result["evaluated_at"] = datetime.now(timezone.utc).isoformat()
+
+    except Exception as exc:
+        log.exception("  Unhandled error evaluating %s", instance_id)
+        eval_result["error"] = f"Unhandled exception: {exc!s:.200}"
+        eval_result["evaluated_at"] = datetime.now(timezone.utc).isoformat()
+
+    finally:
+        if cleanup:
+            cleanup_eval(instance_id)
+
+    return eval_result
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +769,10 @@ def main() -> None:
         "--cleanup", action="store_true",
         help="Remove eval working directories after each task",
     )
+    parser.add_argument(
+        "--update-tasks", action="store_true",
+        help="Write eval_result back into each task JSON file in dataset/",
+    )
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -641,6 +813,22 @@ def main() -> None:
             }
 
         results.append(result)
+
+        # Write eval_result back into the task JSON if requested
+        if args.update_tasks:
+            from .task_store import update_task_eval_result
+
+            eval_result_for_task = {
+                "status": result["status"],
+                "model": result.get("model") or args.model,
+                "agent_time_seconds": result.get("agent_time_seconds", 0.0),
+                "token_count": result.get("token_count"),
+                "tool_calls": result.get("tool_calls"),
+                "sanity_check": result.get("sanity_check", False),
+                "evaluated_at": datetime.now(timezone.utc).isoformat(),
+                "error": result.get("error"),
+            }
+            update_task_eval_result(eval_result_for_task, instance_id, DATASET_DIR)
 
         if args.cleanup:
             cleanup_eval(instance_id)

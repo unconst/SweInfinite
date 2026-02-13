@@ -64,7 +64,7 @@ from .quality_scorer import assess_quality, heuristic_issue_prefilter
 from .recipe_generator import generate_recipe
 from .repo_ops import extract_candidate
 from .repo_quality import check_repo_quality
-from .task_store import build_task_instance, make_instance_id, store_task
+from .task_store import build_task_instance, make_instance_id, store_task, update_task_eval_result
 from .validator import validate_task
 from .versioning import find_version_for_commit
 from .paths import DATASET_DIR, REPOS_DIR, LOG_FILE
@@ -87,11 +87,11 @@ class FilterConfig:
     """
 
     # --- repo filters ---
-    min_stars: int = 5
-    min_contributors: int = 1
+    min_stars: int = 0
+    min_contributors: int = 0
     require_ci: bool = False
-    require_tests: bool = True
-    allow_archived: bool = False
+    require_tests: bool = False
+    allow_archived: bool = True
     allow_non_permissive: bool = True
     languages: set[str] = field(default_factory=lambda: set(SUPPORTED_LANGUAGES))
 
@@ -103,18 +103,24 @@ class FilterConfig:
     max_patch_files: int = 15
     min_patch_lines: int = 3
     max_patch_lines: int = 1000
+    skip_patch_checks: bool = True
 
     # --- quality filters ---
     min_quality_score: int = 2
-    skip_quality: bool = False
-    skip_decontamination: bool = False
+    skip_quality: bool = True
+    skip_decontamination: bool = True
 
     # --- test generation ---
-    generate_tests: bool = False
+    generate_tests: bool = True
 
     # --- validation ---
-    skip_validation: bool = False
+    skip_validation: bool = True
     use_docker: bool = False
+
+    # --- evaluation (agent solving) ---
+    run_eval: bool = False
+    eval_model: str = "opus-4.6"
+    eval_timeout: int = 300
 
 log = logging.getLogger("swe-infinite")
 
@@ -463,9 +469,13 @@ def extract_one(
     This is EXPENSIVE — involves git cloning, diff computation, and validation.
     Only runs on PRs that passed annotation checks.
 
+    After processing (success or failure), the cloned repo is removed to save
+    disk space.
+
     Returns: "task", "skip", "empty", or "error".
     """
     conn = get_connection(db_path)
+    repo_dir: Path | None = None  # track for cleanup
 
     try:
         # --- Pick best candidate from annotations ---
@@ -495,6 +505,9 @@ def extract_one(
         conn.commit()
 
         # --- Clone repo, compute diff, split patches ---
+        # Pre-compute expected repo dir for cleanup even if extraction fails
+        repo_dir = REPOS_DIR / repo_name.replace("/", "__")
+
         candidate = {
             "repo_name": repo_name,
             "pr_number": pr_number,
@@ -516,6 +529,7 @@ def extract_one(
                 min_patch_lines=filters.min_patch_lines,
                 max_patch_lines=filters.max_patch_lines,
                 generate_tests=filters.generate_tests,
+                skip_patch_checks=filters.skip_patch_checks,
             )
         except Exception as exc:
             log.exception("  Error extracting %s PR#%d", repo_name, pr_number)
@@ -663,10 +677,13 @@ def extract_one(
             return "skip"
 
         # --- Store ---
-        result = _phase_store(
+        result, task = _phase_store(
             extracted, version, install_config,
             validation_result, quality_scores, db_path,
         )
+
+        # --- Evaluate (optional) ---
+        _phase_eval(task, filters)
 
         # Mark annotation as task_created
         conn.execute(
@@ -678,6 +695,13 @@ def extract_one(
         return result
 
     finally:
+        # Clean up cloned repo to save disk space
+        if repo_dir is not None and repo_dir.exists():
+            log.info("Cleaning up repo: %s", repo_dir.name)
+            try:
+                shutil.rmtree(repo_dir)
+            except OSError:
+                log.warning("Failed to remove repo dir: %s", repo_dir)
         conn.close()
 
 
@@ -772,8 +796,11 @@ def _phase_store(
     extracted: dict, version: str, install_config: dict,
     validation_result: object | None, quality_scores: object | None,
     db_path: Path,
-) -> str:
-    """Phase 5: Rebuild the final task with all enrichment data and save it."""
+) -> tuple[str, dict]:
+    """Phase 5: Rebuild the final task with all enrichment data and save it.
+
+    Returns ("task", task_dict) so downstream phases can use the stored task.
+    """
     task = build_task_instance(
         extracted,
         version=version,
@@ -801,7 +828,55 @@ def _phase_store(
     except Exception:
         log.warning("  Hippius upload failed (non-fatal)", exc_info=True)
 
-    return "task"
+    return "task", task
+
+
+def _phase_eval(task: dict, filters: FilterConfig) -> None:
+    """Phase 6: Run agent evaluation on the generated task.
+
+    Invokes the Cursor agent CLI to attempt solving the task, records
+    whether it succeeded, and writes the eval_result back into the
+    task JSON file on disk.
+
+    This phase is optional and only runs when ``filters.run_eval`` is True.
+    Errors are logged but never abort the pipeline.
+    """
+    if not filters.run_eval:
+        return
+
+    instance_id = task["instance_id"]
+    log.info("  Running agent evaluation on %s (model=%s, timeout=%ds)...",
+             instance_id, filters.eval_model, filters.eval_timeout)
+
+    try:
+        from .eval import evaluate_new_task
+
+        eval_result = evaluate_new_task(
+            task,
+            model=filters.eval_model,
+            agent_timeout=filters.eval_timeout,
+            cleanup=True,
+        )
+
+        # Write eval_result back into the task JSON on disk
+        update_task_eval_result(eval_result, instance_id, DATASET_DIR)
+
+        status = eval_result["status"]
+        elapsed = eval_result.get("agent_time_seconds", 0.0)
+        tokens = eval_result.get("token_count")
+        tools = eval_result.get("tool_calls")
+
+        status_str = status.upper()
+        metrics = f"time={elapsed:.1f}s"
+        if tokens is not None:
+            metrics += f", tokens={tokens}"
+        if tools is not None:
+            metrics += f", tool_calls={tools}"
+
+        log.info("  EVAL RESULT: %s (%s)", status_str, metrics)
+
+    except Exception:
+        log.exception("  Evaluation failed for %s (non-fatal)", instance_id)
 
 
 class _SkipTask(Exception):
@@ -1079,47 +1154,59 @@ def main() -> None:
     # --- Pipeline phase toggles ---
     phase_group = parser.add_argument_group("pipeline phases")
     phase_group.add_argument(
-        "--skip-validation", action="store_true",
-        help="Skip execution validation (FAIL_TO_PASS / PASS_TO_PASS will be empty)",
+        "--validate", action="store_true",
+        help="Enable execution validation (populates FAIL_TO_PASS / PASS_TO_PASS)",
     )
     phase_group.add_argument(
-        "--skip-quality", action="store_true",
-        help="Skip LLM quality scoring",
+        "--quality", action="store_true",
+        help="Enable LLM quality scoring",
     )
     phase_group.add_argument(
-        "--skip-decontamination", action="store_true",
-        help="Skip overlap check against known benchmarks (SWE-bench, etc.)",
+        "--decontamination", action="store_true",
+        help="Enable overlap check against known benchmarks (SWE-bench, etc.)",
     )
     phase_group.add_argument(
         "--docker", action="store_true",
         help="Use Docker for isolated validation environments",
     )
     phase_group.add_argument(
-        "--generate-tests", action="store_true",
-        help="Generate tests via LLM for PRs that have no test changes in the diff",
+        "--no-generate-tests", action="store_true",
+        help="Disable LLM test generation for PRs without test changes",
+    )
+    phase_group.add_argument(
+        "--eval", action="store_true",
+        help="Run Cursor agent evaluation on each generated task",
+    )
+    phase_group.add_argument(
+        "--eval-model", type=str, default="opus-4.6",
+        help="Model for agent evaluation (default: opus-4.6)",
+    )
+    phase_group.add_argument(
+        "--eval-timeout", type=int, default=300,
+        help="Agent timeout in seconds for evaluation (default: 300)",
     )
 
     # --- Repo filters ---
     repo_group = parser.add_argument_group("repo filters")
     repo_group.add_argument(
-        "--min-stars", type=int, default=5,
-        help="Minimum GitHub stars for repo quality gate (default: 5)",
+        "--min-stars", type=int, default=0,
+        help="Minimum GitHub stars for repo quality gate (default: 0)",
     )
     repo_group.add_argument(
-        "--min-contributors", type=int, default=1,
-        help="Minimum number of contributors (default: 1)",
+        "--min-contributors", type=int, default=0,
+        help="Minimum number of contributors (default: 0)",
     )
     repo_group.add_argument(
         "--require-ci", action="store_true",
         help="Require CI/CD configuration (default: not required)",
     )
     repo_group.add_argument(
-        "--no-require-tests", action="store_true",
-        help="Don't require a test framework to be detected",
+        "--require-tests", action="store_true",
+        help="Require a test framework to be detected in repo",
     )
     repo_group.add_argument(
-        "--allow-archived", action="store_true",
-        help="Include archived repositories (default: skip them)",
+        "--no-allow-archived", action="store_true",
+        help="Skip archived repositories",
     )
     repo_group.add_argument(
         "--no-allow-non-permissive", action="store_true",
@@ -1155,6 +1242,10 @@ def main() -> None:
         "--max-patch-lines", type=int, default=1000,
         help="Maximum changed lines in solution patch (default: 1000)",
     )
+    patch_group.add_argument(
+        "--patch-checks", action="store_true",
+        help="Enable patch complexity checks (file count, line count, config-only, comment-only)",
+    )
 
     # --- Quality filters ---
     quality_group = parser.add_argument_group("quality filters")
@@ -1181,8 +1272,8 @@ def main() -> None:
         min_stars=args.min_stars,
         min_contributors=args.min_contributors,
         require_ci=args.require_ci,
-        require_tests=not args.no_require_tests,
-        allow_archived=args.allow_archived,
+        require_tests=args.require_tests,
+        allow_archived=not args.no_allow_archived,
         allow_non_permissive=not args.no_allow_non_permissive,
         languages=languages,
         min_issue_length=args.min_issue_length,
@@ -1190,12 +1281,16 @@ def main() -> None:
         max_patch_files=args.max_patch_files,
         min_patch_lines=args.min_patch_lines,
         max_patch_lines=args.max_patch_lines,
+        skip_patch_checks=not args.patch_checks,
         min_quality_score=args.min_quality_score,
-        generate_tests=args.generate_tests,
-        skip_quality=args.skip_quality,
-        skip_decontamination=args.skip_decontamination,
-        skip_validation=args.skip_validation,
+        generate_tests=not args.no_generate_tests,
+        skip_quality=not args.quality,
+        skip_decontamination=not args.decontamination,
+        skip_validation=not args.validate,
         use_docker=args.docker,
+        run_eval=args.eval,
+        eval_model=args.eval_model,
+        eval_timeout=args.eval_timeout,
     )
 
     global _shutdown  # noqa: PLW0603

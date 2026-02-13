@@ -220,3 +220,38 @@ def load_all_tasks(tasks_dir: Path = TASKS_DIR) -> list[dict]:
         except Exception:
             log.warning("Failed to load %s", p)
     return tasks
+
+
+# ---------------------------------------------------------------------------
+# Eval result update
+# ---------------------------------------------------------------------------
+
+
+def update_task_eval_result(
+    eval_result: dict,
+    instance_id: str,
+    output_dir: Path = TASKS_DIR,
+) -> Path | None:
+    """Write eval_result into an existing task JSON file on disk.
+
+    Loads the task JSON, sets ``task["eval_result"] = eval_result``,
+    and writes it back atomically.
+
+    Returns the path to the updated file, or None if the file was not found.
+    """
+    safe_name = instance_id.replace("/", "__")
+    task_path = output_dir / f"{safe_name}.json"
+
+    if not task_path.exists():
+        log.warning("Task file not found for update: %s", task_path)
+        return None
+
+    try:
+        task = json.loads(task_path.read_text())
+        task["eval_result"] = eval_result
+        task_path.write_text(json.dumps(task, indent=2, default=str))
+        log.info("Updated eval_result in %s", task_path)
+        return task_path
+    except Exception:
+        log.exception("Failed to update eval_result for %s", instance_id)
+        return None

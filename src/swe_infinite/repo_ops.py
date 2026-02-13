@@ -431,6 +431,7 @@ def extract_candidate(
     min_patch_lines: int = 3,
     max_patch_lines: int = 1000,
     generate_tests: bool = False,
+    skip_patch_checks: bool = False,
 ) -> dict | None:
     """Process a single candidate into extracted task data.
 
@@ -444,6 +445,8 @@ def extract_candidate(
         min_patch_lines: Minimum changed lines for patch complexity check.
         max_patch_lines: Maximum changed lines for patch complexity check.
         generate_tests: If True, use LLM to generate tests when PR has no test changes.
+        skip_patch_checks: If True, skip file count and complexity checks
+            (config-only, comment-only, size limits).
 
     Returns a dict with extracted fields or None if the candidate fails validation.
     """
@@ -530,25 +533,26 @@ def extract_candidate(
 
     # 5. File count check
     file_count = count_files_in_patch(solution_patch)
-    if file_count < 1 or file_count > max_patch_files:
+    if not skip_patch_checks and (file_count < 1 or file_count > max_patch_files):
         log.info(
             "Skipping %s PR#%s — solution patch modifies %d files (need 1-%d)",
             repo_name, candidate["pr_number"], file_count, max_patch_files,
         )
         return None
 
-    # 6. Patch complexity check
-    complexity_issue = validate_patch_complexity(
-        solution_patch,
-        min_changed_lines=min_patch_lines,
-        max_changed_lines=max_patch_lines,
-    )
-    if complexity_issue:
-        log.info(
-            "Skipping %s PR#%s — %s",
-            repo_name, candidate["pr_number"], complexity_issue,
+    # 6. Patch complexity check (config-only, comment-only, size limits)
+    if not skip_patch_checks:
+        complexity_issue = validate_patch_complexity(
+            solution_patch,
+            min_changed_lines=min_patch_lines,
+            max_changed_lines=max_patch_lines,
         )
-        return None
+        if complexity_issue:
+            log.info(
+                "Skipping %s PR#%s — %s",
+                repo_name, candidate["pr_number"], complexity_issue,
+            )
+            return None
 
     # Determine which commit was used
     commit_name = "head_commit" if head_sha else "merge_commit"
