@@ -19,6 +19,10 @@ Usage:
     uv run python swe_infinite.py --skip-quality        # skip LLM quality scoring
     uv run python swe_infinite.py --docker              # use Docker for validation
     uv run python swe_infinite.py --min-stars 10        # require 10+ GitHub stars
+    uv run python swe_infinite.py --allow-non-permissive  # include non-permissive licenses
+    uv run python swe_infinite.py --languages python,go   # only these languages
+    uv run python swe_infinite.py --max-patch-files 30    # allow up to 30 files in patch
+    uv run python swe_infinite.py --skip-decontamination  # skip overlap check
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ import signal
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -41,13 +46,16 @@ import httpx
 
 from .db import (
     DEFAULT_DB_PATH,
+    get_annotation_stats,
     get_connection,
+    get_extractable_annotations,
     get_stats,
     init_db,
     insert_validation_result,
     is_hour_ingested,
     mark_hour_ingested,
-    update_candidate_status,
+    update_annotation_extraction,
+    upsert_annotation,
 )
 from .decontamination import check_contamination
 from .gharchive import download_and_parse_hour
@@ -63,6 +71,46 @@ from .paths import DATASET_DIR, REPOS_DIR, LOG_FILE
 
 # Supported languages (extensible — see language_support.py for handlers)
 SUPPORTED_LANGUAGES = {"python", "typescript", "javascript", "java", "go"}
+
+
+# ---------------------------------------------------------------------------
+# Filter configuration — every filter knob, settable from CLI
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FilterConfig:
+    """All tuneable filter settings for the pipeline.
+
+    Each field corresponds to a CLI flag so operators can relax or tighten
+    any filter without touching code.
+    """
+
+    # --- repo filters ---
+    min_stars: int = 5
+    min_contributors: int = 1
+    require_ci: bool = False
+    require_tests: bool = True
+    allow_archived: bool = False
+    allow_non_permissive: bool = False
+    languages: set[str] = field(default_factory=lambda: set(SUPPORTED_LANGUAGES))
+
+    # --- issue / PR filters ---
+    min_issue_length: int = 10
+
+    # --- patch filters ---
+    max_patch_files: int = 15
+    min_patch_lines: int = 3
+    max_patch_lines: int = 1000
+
+    # --- quality filters ---
+    min_quality_score: int = 2
+    skip_quality: bool = False
+    skip_decontamination: bool = False
+
+    # --- validation ---
+    skip_validation: bool = False
+    use_docker: bool = False
 
 log = logging.getLogger("swe-infinite")
 
@@ -118,6 +166,34 @@ def _get_gh_client() -> httpx.Client:
             headers["Authorization"] = f"token {token}"
         _gh_client = httpx.Client(timeout=30, follow_redirects=True, headers=headers)
     return _gh_client
+
+
+def _fetch_issue_from_api(repo_name: str, issue_num: int) -> tuple[str | None, str | None]:
+    """Fetch an issue's title and body from the GitHub API.
+
+    Returns (title, body) on success, or (None, None) on failure.
+    """
+    client = _get_gh_client()
+    url = f"{_GITHUB_API}/repos/{repo_name}/issues/{issue_num}"
+    try:
+        resp = client.get(url)
+    except httpx.HTTPError as exc:
+        log.debug("  API error fetching issue %s#%d: %s", repo_name, issue_num, exc)
+        return None, None
+
+    if resp.status_code != 200:
+        log.debug("  Got %d fetching issue %s#%d", resp.status_code, repo_name, issue_num)
+        return None, None
+
+    data = resp.json()
+    # Make sure it's actually an issue, not a pull request
+    if data.get("pull_request"):
+        log.debug("  #%d is a pull request, not an issue", issue_num)
+        return None, None
+
+    title = data.get("title", "")
+    body = (data.get("body") or "")[:50000]
+    return title, body
 
 
 def _enrich_pr(conn: sqlite3.Connection, event_id: str, repo_name: str, pr_number: int) -> dict | None:
@@ -192,69 +268,75 @@ def _enrich_pr(conn: sqlite3.Connection, event_id: str, repo_name: str, pr_numbe
 # Issue linking
 # ---------------------------------------------------------------------------
 
-_ISSUE_RE = re.compile(
+# Strong signal: "fixes #N", "closes #N", "resolves #N", etc.
+_ISSUE_RE_STRONG = re.compile(
     r"(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s+"
     r"(?:https?://github\.com/[\w\-\.]+/[\w\-\.]+/issues/(\d+)|#(\d+))",
     re.IGNORECASE,
 )
 
+# Medium signal: "addresses #N", "refs #N", "related to #N", "for #N", "re: #N"
+_ISSUE_RE_MEDIUM = re.compile(
+    r"(?:address(?:es|ed)?|refs?|related\s+to|for|re:?|see)\s+"
+    r"(?:https?://github\.com/[\w\-\.]+/[\w\-\.]+/issues/(\d+)|#(\d+))",
+    re.IGNORECASE,
+)
+
+# Weak signal: full GitHub issue URL (explicit /issues/ path, no keyword needed)
+_ISSUE_RE_URL = re.compile(
+    r"https?://github\.com/[\w\-\.]+/[\w\-\.]+/issues/(\d+)",
+    re.IGNORECASE,
+)
+
 
 def _find_linked_issue(title: str, body: str) -> int | None:
-    """Find a single linked issue number from PR title+body. Returns None if 0 or >1."""
-    issues: set[int] = set()
-    for text in (title, body):
-        for m in _ISSUE_RE.finditer(text or ""):
-            num = m.group(1) or m.group(2)
-            if num:
-                issues.add(int(num))
-    if len(issues) == 1:
-        return issues.pop()
+    """Find a single linked issue number from PR title+body. Returns None if 0 or >1.
+
+    Checks in priority order: strong keywords (fix/close/resolve), medium keywords
+    (addresses/refs/related), then bare GitHub issue URLs.
+    """
+    for regex in (_ISSUE_RE_STRONG, _ISSUE_RE_MEDIUM, _ISSUE_RE_URL):
+        issues: set[int] = set()
+        for text in (title, body):
+            for m in regex.finditer(text or ""):
+                # URL-only regex has 1 group; keyword regexes have 2
+                if regex.groups == 1:
+                    num = m.group(1)
+                else:
+                    num = m.group(1) or m.group(2)
+                if num:
+                    issues.add(int(num))
+        if len(issues) == 1:
+            return issues.pop()
     return None
 
 
 # ---------------------------------------------------------------------------
-# Core loop: pick one PR, process it fully
+# Phase A: Annotate — enrich one PR, detect metadata, store everything
 # ---------------------------------------------------------------------------
 
 
-def _phase_collect(conn: sqlite3.Connection) -> tuple[dict, dict] | str:
-    """Phase 1: Pick an un-processed merged PR and enrich it via GitHub API.
+def annotate_one(conn: sqlite3.Connection) -> str:
+    """Pick one un-enriched merged PR, enrich it, and store all metadata.
 
-    Returns (row, enriched) on success, or a status string ("empty"/"skip") to abort.
+    This is FAST — only API calls, no git cloning.
+    Every enriched PR gets a row in pr_annotations regardless of viability.
+
+    Returns: "annotated", "skip" (API error), or "empty" (no PRs left).
     """
-    # Pick the next un-enriched merged PR that's in a repo with closed issues
+    # Pick the next un-enriched merged PR
     row = conn.execute(
         """
-        SELECT pr.id, pr.repo_name, pr.number, pr.base_sha, pr.head_sha,
-               pr.merge_commit_sha, pr.default_branch, pr.title, pr.repo_language
-        FROM events pr
-        WHERE pr.type = 'PullRequestEvent'
-          AND pr.merged = 1
-          AND (pr.title IS NULL OR pr.title = '')
-          AND EXISTS (
-              SELECT 1 FROM events iss
-              WHERE iss.type = 'IssuesEvent'
-                AND iss.repo_name = pr.repo_name
-          )
-        ORDER BY pr.created_at DESC
+        SELECT id, repo_name, number, base_sha, head_sha,
+               merge_commit_sha, default_branch, title, repo_language
+        FROM events
+        WHERE type = 'PullRequestEvent'
+          AND merged = 1
+          AND (title IS NULL OR title = '')
+        ORDER BY created_at DESC
         LIMIT 1
         """,
     ).fetchone()
-
-    if row is None:
-        # Try any un-enriched PR (even without matching issue in DB yet)
-        row = conn.execute(
-            """
-            SELECT id, repo_name, number, base_sha, head_sha,
-                   merge_commit_sha, default_branch, title, repo_language
-            FROM events
-            WHERE type = 'PullRequestEvent'
-              AND merged = 1
-              AND (title IS NULL OR title = '')
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-        ).fetchone()
 
     if row is None:
         return "empty"
@@ -263,106 +345,302 @@ def _phase_collect(conn: sqlite3.Connection) -> tuple[dict, dict] | str:
     pr_number = row["number"]
     event_id = row["id"]
 
-    log.info("Processing: %s PR#%d", repo_name, pr_number)
+    log.info("Annotating: %s PR#%d", repo_name, pr_number)
 
+    # --- Enrich via GitHub API ---
     enriched = _enrich_pr(conn, event_id, repo_name, pr_number)
     if enriched is None:
-        return "skip"
+        return "skip"  # API error — already marked in events table
 
-    return row, enriched
-
-
-def _phase_prefilter(
-    conn: sqlite3.Connection, row: dict, enriched: dict, db_path: Path, min_stars: int,
-) -> tuple[dict, str, Path] | str:
-    """Phase 2: Language, issue quality, patch extraction, and repo quality checks.
-
-    Returns (extracted, lang, repo_dir) on success, or a status string to abort.
-    """
-    repo_name = row["repo_name"]
-    pr_number = row["number"]
-
-    # --- Check language ---
+    # --- Detect language ---
     lang = (enriched.get("language") or "").lower()
     lang_map = {
         "javascript": "javascript", "typescript": "typescript", "python": "python",
         "java": "java", "go": "go", "golang": "go",
     }
     lang = lang_map.get(lang, lang)
-    if lang not in SUPPORTED_LANGUAGES:
-        log.info("  Skip: language is %s (supported: %s)",
-                 lang or "unknown", ", ".join(sorted(SUPPORTED_LANGUAGES)))
-        return "skip"
 
     # --- Find linked issue ---
     issue_num = _find_linked_issue(enriched["title"], enriched["body"])
-    if issue_num is None:
-        log.info("  Skip: no single issue link found")
-        return "skip"
 
-    # --- Look up the issue ---
-    issue_row = conn.execute(
-        "SELECT title, body FROM events WHERE repo_name=? AND number=? AND type='IssuesEvent'",
-        (repo_name, issue_num),
-    ).fetchone()
+    issue_title = None
+    issue_body = ""
+    skip_reason = None
 
-    if issue_row is None:
-        log.info("  Skip: issue #%d not in our DB", issue_num)
-        return "skip"
+    if issue_num is not None:
+        # Look up issue (DB first, then GitHub API)
+        issue_row = conn.execute(
+            "SELECT title, body FROM events WHERE repo_name=? AND number=? AND type='IssuesEvent'",
+            (repo_name, issue_num),
+        ).fetchone()
 
-    issue_title = issue_row["title"] or ""
-    issue_body = issue_row["body"] or ""
+        if issue_row is not None:
+            issue_title = issue_row["title"] or ""
+            issue_body = issue_row["body"] or ""
+        else:
+            log.info("  Issue #%d not in DB, fetching from GitHub API...", issue_num)
+            issue_title, issue_body = _fetch_issue_from_api(repo_name, issue_num)
+            if issue_title is None:
+                issue_title = None
+                issue_body = ""
+                skip_reason = f"could not fetch issue #{issue_num} from API"
 
-    if len(issue_body.strip()) <= 10:
-        log.info("  Skip: issue #%d body too short (%d chars)", issue_num, len(issue_body.strip()))
-        return "skip"
+    # --- Heuristic issue quality check ---
+    issue_quality_ok = 0
+    issue_quality_reason = None
+    if issue_num is not None and issue_title is not None:
+        rejection = heuristic_issue_prefilter(issue_title, issue_body)
+        if rejection:
+            issue_quality_reason = rejection
+        else:
+            issue_quality_ok = 1
 
-    # --- Issue quality pre-filter (heuristic, no LLM) ---
-    rejection = heuristic_issue_prefilter(issue_title, issue_body)
-    if rejection:
-        log.info("  Skip: issue quality pre-filter — %s", rejection)
-        return "skip"
-
-    log.info("  Matched: issue #%d — extracting patches...", issue_num)
-
-    # --- Clone repo, compute diff, split patches ---
-    candidate = {
+    # --- Store annotation (NOTHING is filtered out) ---
+    ann = {
+        "event_id": event_id,
         "repo_name": repo_name,
         "pr_number": pr_number,
-        "issue_number": issue_num,
+        "language": lang or None,
+        "issue_num": issue_num,
         "issue_title": issue_title,
-        "issue_body": issue_body,
+        "issue_body": issue_body[:50000] if issue_body else None,
+        "issue_body_len": len((issue_body or "").strip()),
+        "issue_quality_ok": issue_quality_ok,
+        "issue_quality_reason": issue_quality_reason,
         "pr_title": enriched["title"],
+        "pr_body": enriched["body"][:10000] if enriched["body"] else None,
         "base_sha": row["base_sha"],
         "head_sha": row["head_sha"],
         "merge_commit_sha": enriched.get("merge_commit_sha") or row["merge_commit_sha"],
-        "id": None,
+        "status": "annotated",
+        "skip_reason": skip_reason,
+        "annotated_at": datetime.now(timezone.utc).isoformat(),
     }
+    upsert_annotation(conn, ann)
+
+    # Mark event as processed (so we don't re-enrich)
+    conn.execute("UPDATE events SET processed = 1 WHERE id = ?", (event_id,))
+    conn.commit()
+
+    log.info("  Annotated: lang=%s, issue=%s, quality_ok=%d",
+             lang or "?", f"#{issue_num}" if issue_num else "none", issue_quality_ok)
+    return "annotated"
+
+
+# ---------------------------------------------------------------------------
+# Phase B: Extract — pick best annotated candidate, clone, diff, validate
+# ---------------------------------------------------------------------------
+
+
+def extract_one(
+    db_path: Path,
+    filters: FilterConfig,
+) -> str:
+    """Pick the best annotated PR, clone repo, compute diff, validate, store.
+
+    This is EXPENSIVE — involves git cloning, diff computation, and validation.
+    Only runs on PRs that passed annotation checks.
+
+    Returns: "task", "skip", "empty", or "error".
+    """
+    conn = get_connection(db_path)
 
     try:
-        extracted = extract_candidate(candidate)
-    except Exception:
-        log.exception("  Error extracting %s PR#%d", repo_name, pr_number)
-        return "error"
-
-    if extracted is None:
-        log.info("  Skip: extraction failed (license/patch/file count/complexity)")
-        return "skip"
-
-    repo_dir = Path(extracted["repo_dir"])
-
-    # --- Repo quality gate ---
-    try:
-        quality = check_repo_quality(
-            repo_name, repo_dir=repo_dir, min_stars=min_stars, db_path=db_path,
+        # --- Pick best candidate from annotations ---
+        candidates = get_extractable_annotations(
+            conn,
+            languages=filters.languages,
+            min_issue_length=filters.min_issue_length,
+            limit=1,
         )
-        if not quality.passes:
-            log.info("  Skip: repo quality — %s", quality.reason)
-            return "skip"
-    except Exception:
-        log.debug("  Repo quality check failed, continuing anyway")
 
-    return extracted, lang, repo_dir
+        if not candidates:
+            return "empty"
+
+        ann = candidates[0]
+        repo_name = ann["repo_name"]
+        pr_number = ann["pr_number"]
+        event_id = ann["event_id"]
+
+        log.info("Extracting: %s PR#%d (issue #%s)", repo_name, pr_number, ann["issue_num"])
+
+        # Mark as extracting
+        conn.execute(
+            "UPDATE pr_annotations SET status = 'extracting' WHERE event_id = ?",
+            (event_id,),
+        )
+        conn.commit()
+
+        # --- Clone repo, compute diff, split patches ---
+        candidate = {
+            "repo_name": repo_name,
+            "pr_number": pr_number,
+            "issue_number": ann["issue_num"],
+            "issue_title": ann["issue_title"] or "",
+            "issue_body": ann["issue_body"] or "",
+            "pr_title": ann["pr_title"] or "",
+            "base_sha": ann["base_sha"],
+            "head_sha": ann["head_sha"],
+            "merge_commit_sha": ann["merge_commit_sha"],
+            "id": None,
+        }
+
+        try:
+            extracted = extract_candidate(
+                candidate,
+                allow_non_permissive=filters.allow_non_permissive,
+                max_patch_files=filters.max_patch_files,
+                min_patch_lines=filters.min_patch_lines,
+                max_patch_lines=filters.max_patch_lines,
+            )
+        except Exception as exc:
+            log.exception("  Error extracting %s PR#%d", repo_name, pr_number)
+            update_annotation_extraction(conn, event_id, {
+                "has_test_changes": None,
+                "has_solution_changes": None,
+                "solution_files": None,
+                "solution_lines": None,
+                "license_name": None,
+                "license_ok": None,
+                "repo_stars": None,
+                "status": "failed",
+                "skip_reason": f"extraction error: {exc!s:.100}",
+                "extracted_at": datetime.now(timezone.utc).isoformat(),
+            })
+            return "error"
+
+        if extracted is None:
+            # Store what we know even though extraction failed
+            update_annotation_extraction(conn, event_id, {
+                "has_test_changes": 0,
+                "has_solution_changes": 0,
+                "solution_files": 0,
+                "solution_lines": 0,
+                "license_name": None,
+                "license_ok": None,
+                "repo_stars": None,
+                "status": "failed",
+                "skip_reason": "extraction returned None (license/patch/files/complexity)",
+                "extracted_at": datetime.now(timezone.utc).isoformat(),
+            })
+            return "skip"
+
+        repo_dir = Path(extracted["repo_dir"])
+
+        # --- Update annotation with extraction results ---
+        from .repo_ops import count_changed_lines
+        added, removed = count_changed_lines(extracted.get("solution_patch", ""))
+        update_annotation_extraction(conn, event_id, {
+            "has_test_changes": 1 if extracted.get("test_patch", "").strip() else 0,
+            "has_solution_changes": 1 if extracted.get("solution_patch", "").strip() else 0,
+            "solution_files": extracted.get("num_modified_files", 0),
+            "solution_lines": added + removed,
+            "license_name": extracted.get("license_name"),
+            "license_ok": 1,  # if we got here, license was OK
+            "repo_stars": None,  # filled by repo quality check
+            "status": "extracted",
+            "skip_reason": None,
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+        # --- Repo quality gate ---
+        try:
+            quality = check_repo_quality(
+                repo_name,
+                repo_dir=repo_dir,
+                min_stars=filters.min_stars,
+                min_contributors=filters.min_contributors,
+                require_ci=filters.require_ci,
+                require_tests=filters.require_tests,
+                allow_archived=filters.allow_archived,
+                db_path=db_path,
+            )
+            # Store stars even if quality check fails
+            conn.execute(
+                "UPDATE pr_annotations SET repo_stars = ? WHERE event_id = ?",
+                (quality.stars if hasattr(quality, 'stars') else None, event_id),
+            )
+            conn.commit()
+
+            if not quality.passes:
+                log.info("  Skip: repo quality — %s", quality.reason)
+                conn.execute(
+                    "UPDATE pr_annotations SET status = 'failed', skip_reason = ? WHERE event_id = ?",
+                    (f"repo quality: {quality.reason}", event_id),
+                )
+                conn.commit()
+                return "skip"
+        except Exception:
+            log.debug("  Repo quality check failed, continuing anyway")
+
+        lang = ann["language"] or "python"
+
+        # --- Version, recipe, validation ---
+        version = find_version_for_commit(repo_dir, extracted["base_commit"]) or "unknown"
+
+        install_config = None
+        try:
+            install_config = generate_recipe(repo_dir, repo_name, max_retries=2)
+        except Exception:
+            log.debug("  Recipe generation failed, using default")
+
+        if install_config is None:
+            handler = get_handler(lang)
+            if handler:
+                install_config = handler.default_install_recipe(repo_dir)
+            else:
+                install_config = {"install": "pip install -e .", "pre_install": [], "reqs_path": []}
+
+        log.info("  Install recipe: python=%s, install=%s",
+                 install_config.get("python", "?"),
+                 install_config.get("install", "?")[:60])
+
+        task = build_task_instance(
+            extracted, version=version, install_config=install_config,
+            environment_setup_commit=extracted["base_commit"],
+        )
+
+        # --- Validation ---
+        try:
+            validation_result = _phase_validate(
+                conn, task, filters.use_docker, filters.skip_validation,
+            )
+        except _SkipTask:
+            conn.execute(
+                "UPDATE pr_annotations SET status = 'failed', skip_reason = 'validation_failed' WHERE event_id = ?",
+                (event_id,),
+            )
+            conn.commit()
+            return "skip"
+
+        # --- Quality assessment ---
+        try:
+            quality_scores = _phase_quality(task, repo_name, pr_number, filters)
+        except _SkipTask:
+            conn.execute(
+                "UPDATE pr_annotations SET status = 'failed', skip_reason = 'quality_failed' WHERE event_id = ?",
+                (event_id,),
+            )
+            conn.commit()
+            return "skip"
+
+        # --- Store ---
+        result = _phase_store(
+            extracted, version, install_config,
+            validation_result, quality_scores, db_path,
+        )
+
+        # Mark annotation as task_created
+        conn.execute(
+            "UPDATE pr_annotations SET status = 'task_created' WHERE event_id = ?",
+            (event_id,),
+        )
+        conn.commit()
+
+        return result
+
+    finally:
+        conn.close()
 
 
 def _phase_validate(
@@ -408,7 +686,7 @@ def _phase_validate(
 
 
 def _phase_quality(
-    task: dict, repo_name: str, pr_number: int, skip_quality: bool,
+    task: dict, repo_name: str, pr_number: int, filters: FilterConfig,
 ) -> object | None:
     """Phase 4: LLM quality scoring and decontamination check.
 
@@ -416,9 +694,11 @@ def _phase_quality(
     Raises _SkipTask if the task is rejected or contaminated.
     """
     quality_scores = None
-    if not skip_quality:
+    if not filters.skip_quality:
         try:
-            quality_scores = assess_quality(task)
+            quality_scores = assess_quality(
+                task, min_quality_score=filters.min_quality_score,
+            )
 
             if quality_scores.rejection_reason and not quality_scores.passes_threshold:
                 log.info("  Skip: quality assessment — %s", quality_scores.rejection_reason)
@@ -434,17 +714,18 @@ def _phase_quality(
             log.debug("  Quality scoring failed, continuing without scores")
 
     # --- Decontamination check ---
-    try:
-        contamination = check_contamination(
-            task["instance_id"], repo_name, pr_number, task["base_commit"],
-        )
-        if contamination:
-            log.info("  Skip: contaminated — %s", contamination)
-            raise _SkipTask()
-    except _SkipTask:
-        raise
-    except Exception:
-        log.debug("  Decontamination check failed, continuing")
+    if not filters.skip_decontamination:
+        try:
+            contamination = check_contamination(
+                task["instance_id"], repo_name, pr_number, task["base_commit"],
+            )
+            if contamination:
+                log.info("  Skip: contaminated — %s", contamination)
+                raise _SkipTask()
+        except _SkipTask:
+            raise
+        except Exception:
+            log.debug("  Decontamination check failed, continuing")
 
     return quality_scores
 
@@ -472,6 +753,16 @@ def _phase_store(
     log.info("  FAIL_TO_PASS: %d tests, PASS_TO_PASS: %d tests",
              len(task["FAIL_TO_PASS"]), len(task["PASS_TO_PASS"]))
 
+    # Upload to Hippius decentralised storage (fire-and-forget)
+    try:
+        from swe_infinite.hippius import upload_task as hippius_upload
+        if hippius_upload(path):
+            log.info("  Uploaded to Hippius: %s", task["instance_id"])
+        else:
+            log.debug("  Hippius upload skipped (no credentials or not configured)")
+    except Exception:
+        log.warning("  Hippius upload failed (non-fatal)", exc_info=True)
+
     return "task"
 
 
@@ -481,83 +772,30 @@ class _SkipTask(Exception):
 
 def process_one(
     db_path: Path,
-    skip_validation: bool = False,
-    skip_quality: bool = False,
-    use_docker: bool = False,
-    min_stars: int = 5,
+    filters: FilterConfig | None = None,
 ) -> str:
-    """Pick one un-processed merged PR and try to turn it into a dataset task.
+    """Two-phase processing: annotate first, then extract.
 
-    Orchestrates the 5-phase pipeline:
-      1. Collection   — enrich PR, link issue
-      2. Pre-filter   — language, repo quality, issue quality, patch extraction
-      3. Validation   — FAIL_TO_PASS / PASS_TO_PASS via test execution
-      4. Quality      — LLM scoring, decontamination
-      5. Storage      — save final task JSON
+    Phase A: Annotate — enrich a PR and store metadata (fast, API-only).
+    Phase B: Extract — pick best annotated candidate and do expensive work.
 
-    Returns: "task", "skip", "empty", or "error".
+    Returns: "task", "skip", "empty", "annotated", or "error".
     """
+    if filters is None:
+        filters = FilterConfig()
+
     conn = get_connection(db_path)
-
     try:
-        # Phase 1: Collection
-        result = _phase_collect(conn)
-        if isinstance(result, str):
-            return result
-        row, enriched = result
-
-        # Phase 2: Pre-filtering
-        result = _phase_prefilter(conn, row, enriched, db_path, min_stars)
-        if isinstance(result, str):
-            return result
-        extracted, lang, repo_dir = result
-
-        # Phase 3: Version, recipe, validation
-        version = find_version_for_commit(repo_dir, extracted["base_commit"]) or "unknown"
-
-        install_config = None
-        try:
-            install_config = generate_recipe(repo_dir, row["repo_name"], max_retries=2)
-        except Exception:
-            log.debug("  Recipe generation failed, using default")
-
-        if install_config is None:
-            handler = get_handler(lang)
-            if handler:
-                install_config = handler.default_install_recipe(repo_dir)
-            else:
-                install_config = {"install": "pip install -e .", "pre_install": [], "reqs_path": []}
-
-        log.info("  Install recipe: python=%s, install=%s",
-                 install_config.get("python", "?"),
-                 install_config.get("install", "?")[:60])
-
-        task = build_task_instance(
-            extracted, version=version, install_config=install_config,
-            environment_setup_commit=extracted["base_commit"],
-        )
-
-        try:
-            validation_result = _phase_validate(conn, task, use_docker, skip_validation)
-        except _SkipTask:
-            return "skip"
-
-        # Phase 4: Quality assessment
-        try:
-            quality_scores = _phase_quality(
-                task, row["repo_name"], row["number"], skip_quality,
-            )
-        except _SkipTask:
-            return "skip"
-
-        # Phase 5: Store
-        return _phase_store(
-            extracted, version, install_config,
-            validation_result, quality_scores, db_path,
-        )
-
+        # Phase A: annotate next un-enriched PR (fast)
+        status = annotate_one(conn)
+        if status == "annotated":
+            return "annotated"
+        # If "empty" or "skip", fall through to try extraction
     finally:
         conn.close()
+
+    # Phase B: try to extract from annotated pool (expensive)
+    return extract_one(db_path, filters)
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +867,7 @@ def print_stats(db_path: Path) -> None:
     try:
         conn = get_connection(db_path)
         stats = get_stats(conn)
+        ann_stats = get_annotation_stats(conn)
         conn.close()
     except Exception:
         log.warning("Database not initialized yet.")
@@ -639,27 +878,44 @@ def print_stats(db_path: Path) -> None:
     prs_enriched = stats.get("prs_enriched", 0)
 
     print()
-    print("=" * 56)
+    print("=" * 64)
     print("  SWE Infinite — Pipeline Statistics")
-    print("=" * 56)
-    print(f"  GH Archive hours ingested:  {stats.get('hours_ingested', 0):>8,}")
-    print(f"  Events in database:         {stats.get('events', 0):>8,}")
+    print("=" * 64)
+    print(f"  GH Archive hours ingested:     {stats.get('hours_ingested', 0):>8,}")
+    print(f"  Events in database:            {stats.get('events', 0):>8,}")
     if stats.get("events_by_type"):
         for t, c in stats["events_by_type"].items():
-            print(f"    {t + ':':30s}{c:>8,}")
-    print(f"  Merged PRs (enriched/total):{prs_enriched:>5,} / {prs_total:,}")
-    print(f"  Unique repos seen:          {stats.get('unique_repos', 0):>8,}")
-    print(f"  Tasks in database:          {stats.get('tasks', 0):>8,}")
-    print(f"  Dataset files on disk:      {dataset_count:>8,}")
-    print(f"  Dataset directory:          {DATASET_DIR}")
+            print(f"    {t + ':':30s}  {c:>8,}")
+    print(f"  Merged PRs (enriched/total):   {prs_enriched:>5,} / {prs_total:,}")
+    print(f"  Unique repos seen:             {stats.get('unique_repos', 0):>8,}")
+
+    # --- Annotation breakdown ---
+    if ann_stats.get("total", 0) > 0:
+        print()
+        print(f"  PR Annotations:                {ann_stats['total']:>8,}")
+        print(f"    With linked issue:           {ann_stats.get('with_issue', 0):>8,}")
+        print(f"    Extraction-ready:            {ann_stats.get('extraction_ready', 0):>8,}")
+        if ann_stats.get("by_language"):
+            print(f"    By language:")
+            for lang, cnt in sorted(ann_stats["by_language"].items(), key=lambda x: -x[1]):
+                print(f"      {lang + ':':28s}  {cnt:>8,}")
+        if ann_stats.get("by_status"):
+            print(f"    By status:")
+            for st, cnt in sorted(ann_stats["by_status"].items(), key=lambda x: -x[1]):
+                print(f"      {st + ':':28s}  {cnt:>8,}")
+
+    print()
+    print(f"  Tasks in database:             {stats.get('tasks', 0):>8,}")
+    print(f"  Dataset files on disk:         {dataset_count:>8,}")
+    print(f"  Dataset directory:             {DATASET_DIR}")
     if stats.get("validations_by_status"):
         print(f"  Validation results:")
         for s, c in stats["validations_by_status"].items():
-            print(f"    {s + ':':30s}{c:>8,}")
+            print(f"    {s + ':':30s}  {c:>8,}")
     if stats.get("repos_quality_checked"):
-        print(f"  Repos quality-checked:      {stats['repos_quality_checked']:>8,}")
-        print(f"  Repos passing quality:      {stats['repos_passing_quality']:>8,}")
-    print("=" * 56)
+        print(f"  Repos quality-checked:         {stats['repos_quality_checked']:>8,}")
+        print(f"  Repos passing quality:         {stats['repos_passing_quality']:>8,}")
+    print("=" * 64)
     print()
 
 
@@ -778,25 +1034,89 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="Produce one task then exit")
     parser.add_argument("--status", action="store_true", help="Print stats and exit")
     parser.add_argument(
-        "--skip-validation", action="store_true",
-        help="Skip execution validation (FAIL_TO_PASS / PASS_TO_PASS will be empty)",
-    )
-    parser.add_argument(
-        "--skip-quality", action="store_true",
-        help="Skip LLM quality scoring",
-    )
-    parser.add_argument(
-        "--docker", action="store_true",
-        help="Use Docker for isolated validation environments",
-    )
-    parser.add_argument(
-        "--min-stars", type=int, default=5,
-        help="Minimum GitHub stars for repo quality gate (default: 5)",
-    )
-    parser.add_argument(
         "--parallel", type=int, default=1, metavar="N",
         help="Number of parallel workers for task processing (default: 1)",
     )
+
+    # --- Pipeline phase toggles ---
+    phase_group = parser.add_argument_group("pipeline phases")
+    phase_group.add_argument(
+        "--skip-validation", action="store_true",
+        help="Skip execution validation (FAIL_TO_PASS / PASS_TO_PASS will be empty)",
+    )
+    phase_group.add_argument(
+        "--skip-quality", action="store_true",
+        help="Skip LLM quality scoring",
+    )
+    phase_group.add_argument(
+        "--skip-decontamination", action="store_true",
+        help="Skip overlap check against known benchmarks (SWE-bench, etc.)",
+    )
+    phase_group.add_argument(
+        "--docker", action="store_true",
+        help="Use Docker for isolated validation environments",
+    )
+
+    # --- Repo filters ---
+    repo_group = parser.add_argument_group("repo filters")
+    repo_group.add_argument(
+        "--min-stars", type=int, default=5,
+        help="Minimum GitHub stars for repo quality gate (default: 5)",
+    )
+    repo_group.add_argument(
+        "--min-contributors", type=int, default=1,
+        help="Minimum number of contributors (default: 1)",
+    )
+    repo_group.add_argument(
+        "--require-ci", action="store_true",
+        help="Require CI/CD configuration (default: not required)",
+    )
+    repo_group.add_argument(
+        "--no-require-tests", action="store_true",
+        help="Don't require a test framework to be detected",
+    )
+    repo_group.add_argument(
+        "--allow-archived", action="store_true",
+        help="Include archived repositories (default: skip them)",
+    )
+    repo_group.add_argument(
+        "--allow-non-permissive", action="store_true",
+        help="Include repos with non-permissive or unknown licenses",
+    )
+    repo_group.add_argument(
+        "--languages", type=str, default=None,
+        help="Comma-separated list of languages to accept (default: python,typescript,javascript,java,go)",
+    )
+
+    # --- Issue / PR filters ---
+    issue_group = parser.add_argument_group("issue filters")
+    issue_group.add_argument(
+        "--min-issue-length", type=int, default=10,
+        help="Minimum issue body length in characters (default: 10)",
+    )
+
+    # --- Patch filters ---
+    patch_group = parser.add_argument_group("patch filters")
+    patch_group.add_argument(
+        "--max-patch-files", type=int, default=15,
+        help="Maximum number of files in solution patch (default: 15)",
+    )
+    patch_group.add_argument(
+        "--min-patch-lines", type=int, default=3,
+        help="Minimum changed lines in solution patch (default: 3)",
+    )
+    patch_group.add_argument(
+        "--max-patch-lines", type=int, default=1000,
+        help="Maximum changed lines in solution patch (default: 1000)",
+    )
+
+    # --- Quality filters ---
+    quality_group = parser.add_argument_group("quality filters")
+    quality_group.add_argument(
+        "--min-quality-score", type=int, default=2,
+        help="Minimum quality score (1-5) for issue_text and test dimensions (default: 2)",
+    )
+
     args = parser.parse_args()
 
     _setup_logging()
@@ -806,151 +1126,143 @@ def main() -> None:
         print_stats(args.db)
         return
 
+    # Build FilterConfig from CLI args
+    languages = set(SUPPORTED_LANGUAGES)
+    if args.languages:
+        languages = {l.strip().lower() for l in args.languages.split(",")}
+
+    filter_config = FilterConfig(
+        min_stars=args.min_stars,
+        min_contributors=args.min_contributors,
+        require_ci=args.require_ci,
+        require_tests=not args.no_require_tests,
+        allow_archived=args.allow_archived,
+        allow_non_permissive=args.allow_non_permissive,
+        languages=languages,
+        min_issue_length=args.min_issue_length,
+        max_patch_files=args.max_patch_files,
+        min_patch_lines=args.min_patch_lines,
+        max_patch_lines=args.max_patch_lines,
+        min_quality_score=args.min_quality_score,
+        skip_quality=args.skip_quality,
+        skip_decontamination=args.skip_decontamination,
+        skip_validation=args.skip_validation,
+        use_docker=args.docker,
+    )
+
     global _shutdown  # noqa: PLW0603
     log.info("Starting SWE Infinite pipeline (pid=%d, workers=%d)", os.getpid(), args.parallel)
+    log.info("Filter config: %s", filter_config)
 
     # Seed the DB with some data
     ensure_events(args.db)
 
     tasks_produced = 0
-    skips = 0
+    annotated_count = 0
+    extraction_attempts = 0
     errors = 0
-    consecutive_empty = 0
     consecutive_errors = 0
     start_time = time.monotonic()
     last_heartbeat = time.monotonic()
     last_cleanup = time.monotonic()
 
-    def _process_one_safe() -> str:
-        """Wrapper for process_one with exception handling."""
-        return process_one(
-            args.db,
-            skip_validation=args.skip_validation,
-            skip_quality=args.skip_quality,
-            use_docker=args.docker,
-            min_stars=args.min_stars,
-        )
+    # The main loop alternates between two modes:
+    # 1. ANNOTATE: enrich PRs rapidly (API-only, no cloning)
+    # 2. EXTRACT: pick best annotated candidate and do expensive work
 
-    # --- Parallel mode ---
-    if args.parallel > 1:
-        log.info("Running in parallel mode with %d workers", args.parallel)
-        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-            while not _shutdown:
-                # Submit a batch of tasks
-                futures = []
-                for _ in range(args.parallel):
-                    if _shutdown:
-                        break
-                    futures.append(executor.submit(_process_one_safe))
+    ANNOTATION_BATCH = 20  # annotate this many before trying extraction
 
-                for future in as_completed(futures):
-                    if _shutdown:
-                        break
-                    try:
-                        status = future.result(timeout=600)
-                    except Exception:
-                        log.exception("Unexpected error in parallel worker")
-                        errors += 1
-                        continue
+    while not _shutdown:
+        # --- Periodic heartbeat (every 10 min) ---
+        now_mono = time.monotonic()
+        if now_mono - last_heartbeat >= 600:
+            _log_heartbeat(start_time, tasks_produced, annotated_count, errors, args.db)
+            last_heartbeat = now_mono
 
-                    if status == "task":
-                        tasks_produced += 1
-                        log.info("--- Tasks produced so far: %d ---", tasks_produced)
-                        if args.once:
-                            _shutdown = True
-                    elif status == "error":
-                        errors += 1
-                    elif status == "empty":
-                        consecutive_empty += 1
-
-                # Handle empty state
-                if consecutive_empty >= args.parallel * 2:
-                    try:
-                        got_new = download_next_hour(args.db)
-                    except Exception:
-                        got_new = False
-                    if not got_new:
-                        log.info("No new data. Waiting 5 minutes...")
-                        for _ in range(300):
-                            if _shutdown:
-                                break
-                            time.sleep(1)
-                    consecutive_empty = 0
-
-                time.sleep(0.5)
-    else:
-        # --- Sequential mode (original) ---
-        while not _shutdown:
-            # --- Periodic heartbeat (every 30 min) ---
-            now_mono = time.monotonic()
-            if now_mono - last_heartbeat >= 1800:
-                _log_heartbeat(start_time, tasks_produced, skips, errors, args.db)
-                last_heartbeat = now_mono
-
-            # --- Periodic disk cleanup (every hour) ---
-            if now_mono - last_cleanup >= 3600:
-                try:
-                    cleanup_old_repos()
-                except Exception:
-                    log.exception("Error during repo cleanup")
-                last_cleanup = now_mono
-
-            # --- Process one PR (crash-proof) ---
+        # --- Periodic disk cleanup (every hour) ---
+        if now_mono - last_cleanup >= 3600:
             try:
-                status = _process_one_safe()
+                cleanup_old_repos()
             except Exception:
-                log.exception("Unexpected error in process_one")
-                consecutive_errors += 1
-                errors += 1
-                backoff = min(2 ** consecutive_errors, 300)
-                log.info("Backing off %ds after %d consecutive errors", backoff, consecutive_errors)
-                for _ in range(int(backoff)):
+                log.exception("Error during repo cleanup")
+            last_cleanup = now_mono
+
+        # ============================
+        # PHASE A: Annotate a batch
+        # ============================
+        annotation_empty = False
+        conn = get_connection(args.db)
+        try:
+            for _ in range(ANNOTATION_BATCH):
+                if _shutdown:
+                    break
+                try:
+                    status = annotate_one(conn)
+                except Exception:
+                    log.exception("Error during annotation")
+                    errors += 1
+                    consecutive_errors += 1
+                    if consecutive_errors > 10:
+                        backoff = min(2 ** (consecutive_errors - 10), 60)
+                        log.info("Backing off %ds after %d consecutive errors", backoff, consecutive_errors)
+                        time.sleep(backoff)
+                    continue
+                else:
+                    consecutive_errors = 0
+
+                if status == "annotated":
+                    annotated_count += 1
+                elif status == "empty":
+                    annotation_empty = True
+                    break
+                # "skip" means API error — just continue to next
+        finally:
+            conn.close()
+
+        if annotated_count > 0 and annotated_count % 100 == 0:
+            log.info("--- Annotated %d PRs so far ---", annotated_count)
+
+        # ============================
+        # PHASE B: Try extraction
+        # ============================
+        try:
+            status = extract_one(args.db, filter_config)
+        except Exception:
+            log.exception("Error during extraction")
+            errors += 1
+            status = "error"
+
+        extraction_attempts += 1
+
+        if status == "task":
+            tasks_produced += 1
+            log.info("=== TASK %d PRODUCED ===", tasks_produced)
+            if args.once:
+                break
+
+        elif status == "empty" and annotation_empty:
+            # Both annotation and extraction are empty — need more data
+            log.info("All PRs annotated, no extractable candidates. Downloading more data...")
+            try:
+                got_new = download_next_hour(args.db)
+            except Exception:
+                log.exception("Error downloading next GH Archive hour")
+                got_new = False
+            if not got_new:
+                log.info("No new data available. Waiting 5 minutes...")
+                for _ in range(300):
                     if _shutdown:
                         break
                     time.sleep(1)
-                continue
-            else:
-                consecutive_errors = 0
 
-            if status == "task":
-                tasks_produced += 1
-                skips = 0
-                consecutive_empty = 0
-                log.info("--- Tasks produced so far: %d ---", tasks_produced)
+        # Brief pause between iterations
+        time.sleep(0.05)
 
-                if args.once:
-                    break
-
-            elif status == "skip" or status == "error":
-                skips += 1
-                if status == "error":
-                    errors += 1
-                consecutive_empty = 0
-
-            elif status == "empty":
-                consecutive_empty += 1
-                # Try downloading more data
-                try:
-                    got_new = download_next_hour(args.db)
-                except Exception:
-                    log.exception("Error downloading next GH Archive hour")
-                    got_new = False
-                if not got_new:
-                    if consecutive_empty >= 3:
-                        log.info("No new data available. Waiting 5 minutes...")
-                        for _ in range(300):
-                            if _shutdown:
-                                break
-                            time.sleep(1)
-                        consecutive_empty = 0
-
-            # Brief pause between iterations
-            time.sleep(0.1)
-
-    # Final heartbeat on shutdown
-    _log_heartbeat(start_time, tasks_produced, skips, errors, args.db)
+    # Final summary
+    _log_heartbeat(start_time, tasks_produced, annotated_count, errors, args.db)
     print_stats(args.db)
-    log.info("Done. %d tasks produced, %d PRs skipped, %d errors.", tasks_produced, skips, errors)
+    log.info("Done. %d tasks, %d annotated, %d extraction attempts, %d errors.",
+             tasks_produced, annotated_count, extraction_attempts, errors)
 
 
 if __name__ == "__main__":

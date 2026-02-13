@@ -40,13 +40,15 @@ class QualityScores:
     difficulty_score: int | None = None   # 1-5
     cleaned_problem_statement: str = ""
     rejection_reason: str = ""
+    _min_quality_score: int = 2           # configurable threshold
 
     @property
     def passes_threshold(self) -> bool:
         """Check if the task passes minimum quality thresholds."""
-        if self.issue_text_score is not None and self.issue_text_score < 2:
+        threshold = self._min_quality_score
+        if self.issue_text_score is not None and self.issue_text_score < threshold:
             return False
-        if self.test_score is not None and self.test_score < 2:
+        if self.test_score is not None and self.test_score < threshold:
             return False
         return True
 
@@ -527,11 +529,15 @@ def _heuristic_score(
 # ---------------------------------------------------------------------------
 
 
-def assess_quality(task: dict) -> QualityScores:
+def assess_quality(task: dict, *, min_quality_score: int = 2) -> QualityScores:
     """Full quality assessment of a task candidate.
 
     Combines heuristic pre-filtering with LLM scoring.
     Also cleans the problem statement.
+
+    Args:
+        task: Task dict with problem_statement, patch, test_patch.
+        min_quality_score: Minimum score (1-5) for issue_text and test dimensions.
     """
     problem_statement = task.get("problem_statement") or ""
     solution_patch = task.get("patch") or ""
@@ -549,6 +555,7 @@ def assess_quality(task: dict) -> QualityScores:
         return QualityScores(
             issue_text_score=1,
             rejection_reason=rejection,
+            _min_quality_score=min_quality_score,
         )
 
     rejection = heuristic_patch_quality(solution_patch, test_patch)
@@ -557,6 +564,7 @@ def assess_quality(task: dict) -> QualityScores:
         return QualityScores(
             test_score=1,
             rejection_reason=rejection,
+            _min_quality_score=min_quality_score,
         )
 
     # --- Clean problem statement ---
@@ -565,10 +573,12 @@ def assess_quality(task: dict) -> QualityScores:
     # --- LLM scoring (or heuristic fallback) ---
     scores = score_with_llm(cleaned, solution_patch, test_patch)
     scores.cleaned_problem_statement = cleaned
+    scores._min_quality_score = min_quality_score
 
     if not scores.passes_threshold:
         scores.rejection_reason = (
-            f"Below quality threshold: issue={scores.issue_text_score}, "
+            f"Below quality threshold (min={min_quality_score}): "
+            f"issue={scores.issue_text_score}, "
             f"test={scores.test_score}, difficulty={scores.difficulty_score}"
         )
         log.info("  [quality] %s", scores.rejection_reason)

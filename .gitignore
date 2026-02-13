@@ -2,6 +2,7 @@
 dataset/
 workspace/
 results/
+synth_workdir/
 
 # Database
 *.db

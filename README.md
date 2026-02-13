@@ -47,6 +47,9 @@ The process handles errors gracefully and runs indefinitely. Logs go to stderr a
 | `GITHUB_TOKEN` | Recommended | GitHub personal access token. Without it, API rate limit is 60 req/hr vs 5,000. |
 | `ANTHROPIC_API_KEY` | Optional | Enables LLM-based quality scoring via Claude. |
 | `OPENAI_API_KEY` | Optional | Fallback LLM provider for quality scoring. |
+| `HIPPIUS_ACCESS_KEY` | Optional | Hippius S3 access key (starts with `hip_`) for uploading tasks to decentralized storage. |
+| `HIPPIUS_SECRET_KEY` | Optional | Hippius S3 secret key (paired with access key above). |
+| `HIPPIUS_MNEMONIC` | Optional | Legacy Hippius subaccount mnemonic (fallback if access keys not set). |
 
 ### Generator Flags (`swe-infinite`)
 
@@ -138,13 +141,54 @@ journalctl -u swe-infinite -f
 
 </details>
 
+## Decentralized Storage (Hippius)
+
+Generated tasks are automatically uploaded to the [Hippius](https://hippius.com) decentralized S3 bucket, giving the dataset blockchain-anchored timestamps and censorship-resistant availability.
+
+### Setup
+
+Set your Hippius S3 access keys as environment variables (get them from [console.hippius.com/dashboard/settings](https://console.hippius.com/dashboard/settings)):
+
+```bash
+export HIPPIUS_ACCESS_KEY="hip_your_access_key_here"
+export HIPPIUS_SECRET_KEY="your_secret_key_here"
+```
+
+When credentials are set, every task saved by the pipeline is also uploaded to the `swe-infinite-dataset` bucket on `s3.hippius.com`. If the variables are not set, the pipeline runs normally without uploading -- local storage is never blocked.
+
+### Downloading the Dataset
+
+Anyone can pull the full dataset without credentials:
+
+```bash
+# Install the package, then:
+swe-pull
+
+# Download to a custom directory
+swe-pull --output ./my-tasks
+
+# Use a different bucket
+swe-pull --bucket my-custom-bucket
+```
+
+### Public URL
+
+Tasks are publicly browsable at:
+
+```
+https://s3.hippius.com/swe-infinite-dataset/tasks/
+```
+
+Each task is stored as `tasks/{instance_id}.json`.
+
 ## Project Structure
 
 ```
 src/swe_infinite/
   __init__.py            Package version
   __main__.py            python -m swe_infinite support
-  cli.py                 CLI entry points (swe-infinite, swe-eval)
+  cli.py                 CLI entry points (swe-infinite, swe-eval, swe-pull)
+  hippius.py             Hippius S3 decentralized storage integration
   paths.py               Centralized runtime path definitions
   pipeline.py            Main generation pipeline (5-phase orchestrator)
   eval.py                Evaluation harness

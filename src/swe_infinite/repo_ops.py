@@ -321,7 +321,8 @@ _LICENSE_FILE_NAMES = [
 def detect_license(repo_dir: Path) -> str | None:
     """Detect the license of a repository by reading common license files.
 
-    Returns the SPDX-like name if permissive, or None if not found/not permissive.
+    Returns the SPDX-like name if recognized (permissive or non-permissive),
+    or None if not found/unrecognized.
     """
     for name in _LICENSE_FILE_NAMES:
         license_file = repo_dir / name
@@ -331,18 +332,62 @@ def detect_license(repo_dir: Path) -> str | None:
             except Exception:
                 continue
 
+            # Check permissive first
             for keyword, spdx in _LICENSE_KEYWORDS:
                 if keyword in text:
                     return spdx
 
+            # Check non-permissive
+            for keyword in _NON_PERMISSIVE_KEYWORDS:
+                if keyword in text:
+                    if "affero" in text:
+                        return "AGPL-3.0"
+                    if "lesser" in text:
+                        return "LGPL-3.0"
+                    if "gnu general public" in text:
+                        return "GPL-3.0"
+                    if "server side" in text:
+                        return "SSPL-1.0"
+                    if "business source" in text:
+                        return "BUSL-1.1"
+                    if "elastic" in text:
+                        return "Elastic-2.0"
+
     return None
 
 
+# Licenses that are explicitly non-permissive (hard reject)
+_NON_PERMISSIVE_LICENSES = {
+    "gpl-2.0", "gpl-3.0", "agpl-3.0", "lgpl-2.1", "lgpl-3.0",
+    "sspl-1.0", "busl-1.1", "elastic-2.0",
+}
+
+# Keywords that indicate a non-permissive license in LICENSE file text
+_NON_PERMISSIVE_KEYWORDS = [
+    "gnu general public license",
+    "gnu affero general public license",
+    "server side public license",
+    "business source license",
+    "elastic license",
+]
+
+
 def is_permissive_license(license_name: str | None) -> bool:
-    """Check if a license name is in our permissive allowlist."""
+    """Check if a license name is acceptable.
+
+    Returns True for:
+    - Known permissive licenses
+    - Unknown/undetected licenses (None) — treated as acceptable
+    Returns False only for explicitly non-permissive licenses.
+    """
     if not license_name:
+        return True  # Unknown license is OK — most public repos are usable
+    name = license_name.lower()
+    if name in PERMISSIVE_LICENSES:
+        return True
+    if name in _NON_PERMISSIVE_LICENSES:
         return False
-    return license_name.lower() in PERMISSIVE_LICENSES
+    return True  # Unknown license type — default to accept
 
 
 # ---------------------------------------------------------------------------
@@ -350,11 +395,25 @@ def is_permissive_license(license_name: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def extract_candidate(candidate: dict) -> dict | None:
+def extract_candidate(
+    candidate: dict,
+    *,
+    allow_non_permissive: bool = False,
+    max_patch_files: int = 15,
+    min_patch_lines: int = 3,
+    max_patch_lines: int = 1000,
+) -> dict | None:
     """Process a single candidate into extracted task data.
 
     Clones the repo (if needed), computes the diff, splits patches,
     checks license, and validates file count.
+
+    Args:
+        candidate: Dict with repo_name, base_sha, head_sha, merge_commit_sha, etc.
+        allow_non_permissive: If True, skip the permissive license check.
+        max_patch_files: Maximum files allowed in the solution patch.
+        min_patch_lines: Minimum changed lines for patch complexity check.
+        max_patch_lines: Maximum changed lines for patch complexity check.
 
     Returns a dict with extracted fields or None if the candidate fails validation.
     """
@@ -374,7 +433,7 @@ def extract_candidate(candidate: dict) -> dict | None:
 
     # 2. License check
     license_name = detect_license(repo_dir)
-    if not is_permissive_license(license_name):
+    if not allow_non_permissive and not is_permissive_license(license_name):
         log.info("Skipping %s — non-permissive or unknown license: %s", repo_name, license_name)
         return None
 
@@ -395,17 +454,21 @@ def extract_candidate(candidate: dict) -> dict | None:
         log.info("Skipping %s PR#%s — no test changes", repo_name, candidate["pr_number"])
         return None
 
-    # 5. File count check (1-15 files in solution patch)
+    # 5. File count check
     file_count = count_files_in_patch(solution_patch)
-    if file_count < 1 or file_count > 15:
+    if file_count < 1 or file_count > max_patch_files:
         log.info(
-            "Skipping %s PR#%s — solution patch modifies %d files (need 1-15)",
-            repo_name, candidate["pr_number"], file_count,
+            "Skipping %s PR#%s — solution patch modifies %d files (need 1-%d)",
+            repo_name, candidate["pr_number"], file_count, max_patch_files,
         )
         return None
 
     # 6. Patch complexity check
-    complexity_issue = validate_patch_complexity(solution_patch)
+    complexity_issue = validate_patch_complexity(
+        solution_patch,
+        min_changed_lines=min_patch_lines,
+        max_changed_lines=max_patch_lines,
+    )
     if complexity_issue:
         log.info(
             "Skipping %s PR#%s — %s",

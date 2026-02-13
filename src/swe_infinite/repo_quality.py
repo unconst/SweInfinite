@@ -254,17 +254,31 @@ def check_repo_quality(
     min_contributors: int = 1,
     require_ci: bool = False,
     require_tests: bool = True,
+    allow_archived: bool = False,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> RepoQuality:
     """Check if a repository meets quality thresholds.
 
     Uses cached data when available to minimize API calls.
+
+    Args:
+        allow_archived: If True, don't reject archived repositories.
     """
     # Check cache first
     conn = get_connection(db_path)
     try:
         cached = _get_cached_quality(conn, repo_name)
         if cached is not None:
+            # Re-evaluate with current thresholds (cache stores raw data,
+            # thresholds may have changed via CLI flags)
+            cached = _apply_thresholds(
+                cached,
+                min_stars=min_stars,
+                min_contributors=min_contributors,
+                require_ci=require_ci,
+                require_tests=require_tests,
+                allow_archived=allow_archived,
+            )
             log.debug("Using cached quality for %s (passes=%s)", repo_name, cached.passes)
             return cached
     finally:
@@ -291,7 +305,36 @@ def check_repo_quality(
         quality.has_test_framework = _check_test_framework(repo_dir)
 
     # --- Apply thresholds ---
-    if quality.is_archived:
+    quality = _apply_thresholds(
+        quality,
+        min_stars=min_stars,
+        min_contributors=min_contributors,
+        require_ci=require_ci,
+        require_tests=require_tests,
+        allow_archived=allow_archived,
+    )
+
+    # Cache result
+    conn = get_connection(db_path)
+    try:
+        _cache_quality(conn, quality)
+    finally:
+        conn.close()
+
+    return quality
+
+
+def _apply_thresholds(
+    quality: RepoQuality,
+    *,
+    min_stars: int = 5,
+    min_contributors: int = 1,
+    require_ci: bool = False,
+    require_tests: bool = True,
+    allow_archived: bool = False,
+) -> RepoQuality:
+    """Apply quality thresholds to a RepoQuality object."""
+    if not allow_archived and quality.is_archived:
         quality.passes = False
         quality.reason = "Repository is archived"
     elif quality.stars < min_stars:
@@ -309,12 +352,4 @@ def check_repo_quality(
     else:
         quality.passes = True
         quality.reason = "OK"
-
-    # Cache result
-    conn = get_connection(db_path)
-    try:
-        _cache_quality(conn, quality)
-    finally:
-        conn.close()
-
     return quality

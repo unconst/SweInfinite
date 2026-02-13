@@ -35,14 +35,53 @@ CREATE TABLE IF NOT EXISTS events (
     merge_commit_sha TEXT,
     default_branch TEXT,
     created_at    TEXT,
-    ingested_at   TEXT    NOT NULL
+    ingested_at   TEXT    NOT NULL,
+    processed     INTEGER DEFAULT 0    -- 1 once fully processed (task created or skipped)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_repo   ON events (repo_name);
 CREATE INDEX IF NOT EXISTS idx_events_type   ON events (type);
 CREATE INDEX IF NOT EXISTS idx_events_number ON events (repo_name, number);
 
--- Linked candidates (issue <-> PR) that pass preliminary filters
+-- Annotation table: stores metadata for every enriched PR (nothing is thrown away)
+CREATE TABLE IF NOT EXISTS pr_annotations (
+    event_id          TEXT PRIMARY KEY,
+    repo_name         TEXT NOT NULL,
+    pr_number         INTEGER NOT NULL,
+    language          TEXT,                  -- detected repo language (lowercased)
+    issue_num         INTEGER,              -- linked issue number (NULL = none found)
+    issue_title       TEXT,
+    issue_body        TEXT,
+    issue_body_len    INTEGER DEFAULT 0,    -- length of issue body (for quick filtering)
+    issue_quality_ok  INTEGER DEFAULT 0,    -- 1 if passed heuristic issue pre-filter
+    issue_quality_reason TEXT,              -- why it failed heuristic pre-filter (NULL = passed)
+    pr_title          TEXT,
+    pr_body           TEXT,
+    base_sha          TEXT,
+    head_sha          TEXT,
+    merge_commit_sha  TEXT,
+    -- Extraction results (filled after clone/diff, NULL until then)
+    has_test_changes  INTEGER,              -- 1 if diff includes test files
+    has_solution_changes INTEGER,           -- 1 if diff includes non-test files
+    solution_files    INTEGER,              -- number of files in solution patch
+    solution_lines    INTEGER,              -- changed lines in solution patch
+    license_name      TEXT,                 -- detected license SPDX
+    license_ok        INTEGER,              -- 1 if permissive/unknown
+    -- Repo quality (filled from repo_quality table or API)
+    repo_stars        INTEGER,
+    -- Status tracking
+    status            TEXT DEFAULT 'annotated',  -- annotated | extracting | extracted | task_created | failed
+    skip_reason       TEXT,                 -- summary of why this PR can't become a task (NULL = viable)
+    annotated_at      TEXT NOT NULL,
+    extracted_at      TEXT,
+    UNIQUE(repo_name, pr_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_annotations_status   ON pr_annotations (status);
+CREATE INDEX IF NOT EXISTS idx_annotations_language ON pr_annotations (language);
+CREATE INDEX IF NOT EXISTS idx_annotations_repo     ON pr_annotations (repo_name);
+
+-- Legacy candidates table (kept for backward compat, unused by new pipeline)
 CREATE TABLE IF NOT EXISTS candidates (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     repo_name     TEXT    NOT NULL,
@@ -52,13 +91,10 @@ CREATE TABLE IF NOT EXISTS candidates (
     issue_body    TEXT,
     pr_title      TEXT,
     pr_body       TEXT,
-    status        TEXT    DEFAULT 'pending',   -- pending | extracted | failed
+    status        TEXT    DEFAULT 'pending',
     created_at    TEXT    NOT NULL,
     UNIQUE(repo_name, issue_number, pr_number)
 );
-
-CREATE INDEX IF NOT EXISTS idx_candidates_repo   ON candidates (repo_name);
-CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates (status);
 
 -- Final task instances in SWE-rebench format
 CREATE TABLE IF NOT EXISTS tasks (
@@ -133,8 +169,150 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
     """Create tables and indexes if they don't exist."""
     conn = get_connection(db_path)
     conn.executescript(_SCHEMA_SQL)
+    # Migration: add 'processed' column if missing (for existing DBs)
+    try:
+        conn.execute("SELECT processed FROM events LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE events ADD COLUMN processed INTEGER DEFAULT 0")
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# PR Annotations CRUD
+# ---------------------------------------------------------------------------
+
+
+def upsert_annotation(conn: sqlite3.Connection, ann: dict) -> None:
+    """Insert or update an annotation row for an enriched PR."""
+    conn.execute(
+        """
+        INSERT INTO pr_annotations
+            (event_id, repo_name, pr_number, language, issue_num,
+             issue_title, issue_body, issue_body_len, issue_quality_ok,
+             issue_quality_reason, pr_title, pr_body,
+             base_sha, head_sha, merge_commit_sha,
+             status, skip_reason, annotated_at)
+        VALUES
+            (:event_id, :repo_name, :pr_number, :language, :issue_num,
+             :issue_title, :issue_body, :issue_body_len, :issue_quality_ok,
+             :issue_quality_reason, :pr_title, :pr_body,
+             :base_sha, :head_sha, :merge_commit_sha,
+             :status, :skip_reason, :annotated_at)
+        ON CONFLICT(repo_name, pr_number) DO UPDATE SET
+            language=excluded.language,
+            issue_num=excluded.issue_num,
+            issue_title=excluded.issue_title,
+            issue_body=excluded.issue_body,
+            issue_body_len=excluded.issue_body_len,
+            issue_quality_ok=excluded.issue_quality_ok,
+            issue_quality_reason=excluded.issue_quality_reason,
+            pr_title=excluded.pr_title,
+            pr_body=excluded.pr_body,
+            base_sha=excluded.base_sha,
+            head_sha=excluded.head_sha,
+            merge_commit_sha=excluded.merge_commit_sha,
+            status=excluded.status,
+            skip_reason=excluded.skip_reason,
+            annotated_at=excluded.annotated_at
+        """,
+        ann,
+    )
+    conn.commit()
+
+
+def update_annotation_extraction(conn: sqlite3.Connection, event_id: str, data: dict) -> None:
+    """Update an annotation row with extraction results (post-clone/diff)."""
+    conn.execute(
+        """
+        UPDATE pr_annotations SET
+            has_test_changes = :has_test_changes,
+            has_solution_changes = :has_solution_changes,
+            solution_files = :solution_files,
+            solution_lines = :solution_lines,
+            license_name = :license_name,
+            license_ok = :license_ok,
+            repo_stars = :repo_stars,
+            status = :status,
+            skip_reason = :skip_reason,
+            extracted_at = :extracted_at
+        WHERE event_id = :event_id
+        """,
+        {**data, "event_id": event_id},
+    )
+    conn.commit()
+
+
+def get_extractable_annotations(
+    conn: sqlite3.Connection,
+    languages: set[str] | None = None,
+    min_issue_length: int = 10,
+    limit: int = 1,
+) -> list[dict]:
+    """Return annotated PRs that look viable for extraction.
+
+    Picks candidates that:
+    - Have a linked issue with sufficient body length
+    - Are in a supported language
+    - Haven't been extracted yet
+    - Passed the heuristic issue quality check
+    """
+    sql = """
+        SELECT * FROM pr_annotations
+        WHERE status = 'annotated'
+          AND issue_num IS NOT NULL
+          AND issue_body_len > ?
+          AND issue_quality_ok = 1
+    """
+    params: list = [min_issue_length]
+
+    if languages:
+        placeholders = ",".join("?" for _ in languages)
+        sql += f" AND language IN ({placeholders})"
+        params.extend(sorted(languages))
+
+    sql += " ORDER BY issue_body_len DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_annotation_stats(conn: sqlite3.Connection) -> dict:
+    """Return a breakdown of pr_annotations for the --status command."""
+    stats: dict = {}
+    try:
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM pr_annotations").fetchone()
+        stats["total"] = row["cnt"]
+
+        # By language
+        rows = conn.execute(
+            "SELECT language, COUNT(*) AS cnt FROM pr_annotations GROUP BY language ORDER BY cnt DESC"
+        ).fetchall()
+        stats["by_language"] = {(r["language"] or "unknown"): r["cnt"] for r in rows}
+
+        # By status
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM pr_annotations GROUP BY status ORDER BY cnt DESC"
+        ).fetchall()
+        stats["by_status"] = {r["status"]: r["cnt"] for r in rows}
+
+        # Issue link rate
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM pr_annotations WHERE issue_num IS NOT NULL"
+        ).fetchone()
+        stats["with_issue"] = row["cnt"]
+
+        # Extraction-ready (have issue, right language, quality OK)
+        row = conn.execute(
+            """SELECT COUNT(*) AS cnt FROM pr_annotations
+               WHERE issue_num IS NOT NULL AND issue_quality_ok = 1 AND issue_body_len > 10"""
+        ).fetchone()
+        stats["extraction_ready"] = row["cnt"]
+
+    except sqlite3.OperationalError:
+        stats = {"total": 0}
+    return stats
 
 
 # ---------------------------------------------------------------------------
