@@ -1,6 +1,7 @@
 # Data & outputs
 workspace/
 results/
+synth_workdir/
 
 # Database
 *.db
