@@ -1173,14 +1173,14 @@ def main() -> None:
         help="Model for agent evaluation (default: opus-4.6)",
     )
     phase_group.add_argument(
-        "--eval-timeout", type=int, default=300,
-        help="Agent timeout in seconds for evaluation (default: 300)",
+        "--eval-timeout", type=int, default=800,
+        help="Agent timeout in seconds for evaluation (default: 800)",
     )
 
     # --- Repo filters ---
     repo_group = parser.add_argument_group("repo filters")
     repo_group.add_argument(
-        "--min-stars", type=int, default=5,
+        "--min-stars", type=int, default=0,
         help="Minimum GitHub stars for repo quality gate (default: 5)",
     )
     repo_group.add_argument(
@@ -1211,7 +1211,7 @@ def main() -> None:
     # --- Issue / PR filters ---
     issue_group = parser.add_argument_group("issue filters")
     issue_group.add_argument(
-        "--min-issue-length", type=int, default=10,
+        "--min-issue-length", type=int, default=0,
         help="Minimum issue body length in characters (default: 10)",
     )
     issue_group.add_argument(
@@ -1230,7 +1230,7 @@ def main() -> None:
         help="Minimum changed lines in solution patch (default: 3)",
     )
     patch_group.add_argument(
-        "--max-patch-lines", type=int, default=1000,
+        "--max-patch-lines", type=int, default=2000,
         help="Maximum changed lines in solution patch (default: 1000)",
     )
     patch_group.add_argument(
