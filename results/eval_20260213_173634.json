@@ -1,0 +1,29 @@
+{
+  "eval_id": "eval_20260213_173634",
+  "timestamp": "2026-02-13T17:36:34.371137+00:00",
+  "config": {
+    "agent_timeout": 180,
+    "skip_install": false,
+    "model": null
+  },
+  "summary": {
+    "total": 1,
+    "resolved": 0,
+    "unresolved": 0,
+    "sanity_fail": 0,
+    "errors": 1,
+    "timeouts": 0,
+    "avg_agent_time": 0.0
+  },
+  "tasks": [
+    {
+      "instance_id": "scholl-lab__variantcentrifuge-69",
+      "repo": "scholl-lab/variantcentrifuge",
+      "status": "error",
+      "agent_time_seconds": 0.0,
+      "sanity_check": false,
+      "test_files": [],
+      "error": "Unhandled exception"
+    }
+  ]
+}
