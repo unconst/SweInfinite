@@ -99,6 +99,18 @@ def build_task_instance(
         "has_test_patch": bool(extracted.get("test_patch")),
         "is_lite": extracted.get("num_modified_files", 0) <= 3,
         "llm_score": llm_score,
+        # Patch size metrics
+        "solution_lines": extracted.get("solution_lines"),
+        "lines_added": extracted.get("lines_added"),
+        "lines_removed": extracted.get("lines_removed"),
+        # Repo quality metrics
+        "repo_stars": extracted.get("repo_stars"),
+        "repo_forks": extracted.get("repo_forks"),
+        "repo_contributors": extracted.get("repo_contributors"),
+        "has_ci": extracted.get("has_ci"),
+        "has_test_framework": extracted.get("has_test_framework"),
+        "is_archived": extracted.get("is_archived"),
+        "is_fork": extracted.get("is_fork"),
     }
 
     # Extract FAIL_TO_PASS and PASS_TO_PASS from validation result

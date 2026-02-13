@@ -3,7 +3,7 @@ Database layer for the SWE-rebench pipeline.
 
 Manages a local SQLite database (pipeline.db) that stores:
   - Raw GitHub Archive events (PullRequestEvent, IssuesEvent)
-  - Linked candidate tasks (issue + PR pairs passing filters)
+  - PR annotations with extraction metadata
   - Final task instances in SWE-rebench schema
 """
 
@@ -80,21 +80,6 @@ CREATE TABLE IF NOT EXISTS pr_annotations (
 CREATE INDEX IF NOT EXISTS idx_annotations_status   ON pr_annotations (status);
 CREATE INDEX IF NOT EXISTS idx_annotations_language ON pr_annotations (language);
 CREATE INDEX IF NOT EXISTS idx_annotations_repo     ON pr_annotations (repo_name);
-
--- Legacy candidates table (kept for backward compat, unused by new pipeline)
-CREATE TABLE IF NOT EXISTS candidates (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo_name     TEXT    NOT NULL,
-    issue_number  INTEGER NOT NULL,
-    pr_number     INTEGER NOT NULL,
-    issue_title   TEXT,
-    issue_body    TEXT,
-    pr_title      TEXT,
-    pr_body       TEXT,
-    status        TEXT    DEFAULT 'pending',
-    created_at    TEXT    NOT NULL,
-    UNIQUE(repo_name, issue_number, pr_number)
-);
 
 -- Final task instances in SWE-rebench format
 CREATE TABLE IF NOT EXISTS tasks (
@@ -376,36 +361,6 @@ def upsert_events_batch(conn: sqlite3.Connection, events: list[dict]) -> int:
     return len(events)
 
 
-def insert_candidate(conn: sqlite3.Connection, candidate: dict) -> bool:
-    """Insert a candidate row. Returns True if inserted, False on duplicate."""
-    try:
-        conn.execute(
-            """
-            INSERT INTO candidates
-                (repo_name, issue_number, pr_number, issue_title, issue_body,
-                 pr_title, pr_body, status, created_at)
-            VALUES
-                (:repo_name, :issue_number, :pr_number, :issue_title, :issue_body,
-                 :pr_title, :pr_body, :status, :created_at)
-            """,
-            candidate,
-        )
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-
-def update_candidate_status(
-    conn: sqlite3.Connection, candidate_id: int, status: str
-) -> None:
-    """Update the status of a candidate."""
-    conn.execute(
-        "UPDATE candidates SET status = ? WHERE id = ?",
-        (status, candidate_id),
-    )
-    conn.commit()
-
-
 def insert_task(conn: sqlite3.Connection, task: dict) -> None:
     """Insert or replace a final task instance."""
     conn.execute(
@@ -478,7 +433,7 @@ def get_validation_result(
 def get_stats(conn: sqlite3.Connection) -> dict:
     """Return pipeline statistics."""
     stats = {}
-    for table in ("events", "candidates", "tasks"):
+    for table in ("events", "tasks"):
         row = conn.execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()
         stats[table] = row["cnt"]
 
@@ -487,12 +442,6 @@ def get_stats(conn: sqlite3.Connection) -> dict:
         "SELECT type, COUNT(*) AS cnt FROM events GROUP BY type"
     ).fetchall()
     stats["events_by_type"] = {r["type"]: r["cnt"] for r in rows}
-
-    # Candidate status breakdown
-    rows = conn.execute(
-        "SELECT status, COUNT(*) AS cnt FROM candidates GROUP BY status"
-    ).fetchall()
-    stats["candidates_by_status"] = {r["status"]: r["cnt"] for r in rows}
 
     # Unique repos in events
     row = conn.execute(

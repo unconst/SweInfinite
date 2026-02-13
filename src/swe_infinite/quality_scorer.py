@@ -9,15 +9,14 @@ Evaluates and scores task candidates across three dimensions:
 Also provides problem statement cleanup to remove noise (boilerplate,
 images, Discord signup text, etc.) while preserving the core problem.
 
-Uses a configurable LLM backend (defaults to Anthropic Claude via API).
-Falls back to heuristic scoring when no API key is available.
+Uses the Cursor agent CLI as the LLM backend.
+Falls back to heuristic scoring when the agent CLI is unavailable.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -322,69 +321,11 @@ def _truncate_patch(patch: str, max_lines: int = 50) -> str:
 
 
 def _call_llm(prompt: str) -> str | None:
-    """Call an LLM via the agent CLI or API.
+    """Call an LLM via the Cursor agent CLI.
 
-    Tries multiple backends:
-    1. Anthropic API (ANTHROPIC_API_KEY)
-    2. OpenAI API (OPENAI_API_KEY)
-    3. Cursor agent CLI (fallback)
+    Requires the ``agent`` command to be available on PATH (installed with
+    Cursor IDE).
     """
-    # Try Anthropic API
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        try:
-            import httpx
-            resp = httpx.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 256,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                try:
-                    return data["content"][0]["text"]
-                except (KeyError, IndexError, TypeError):
-                    log.debug("Anthropic API returned unexpected structure: %s", type(data))
-        except Exception as e:
-            log.debug("Anthropic API failed: %s", e)
-
-    # Try OpenAI API
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        try:
-            import httpx
-            resp = httpx.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "max_tokens": 256,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                try:
-                    return data["choices"][0]["message"]["content"]
-                except (KeyError, IndexError, TypeError):
-                    log.debug("OpenAI API returned unexpected structure: %s", type(data))
-        except Exception as e:
-            log.debug("OpenAI API failed: %s", e)
-
-    # Fallback: Cursor agent CLI
     try:
         result = subprocess.run(
             ["agent", "-p", prompt, "--output-format", "text"],
@@ -392,8 +333,10 @@ def _call_llm(prompt: str) -> str | None:
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    except FileNotFoundError:
+        log.warning("Cursor agent CLI ('agent') not found on PATH – install Cursor IDE first")
+    except subprocess.TimeoutExpired:
+        log.warning("Cursor agent CLI timed out after 60 s")
 
     return None
 

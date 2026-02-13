@@ -128,7 +128,7 @@ def _setup_logging() -> None:
     """Configure logging with both stderr and rotating file output."""
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 
-    # Console handler (stderr — captured by systemd/launchd journal)
+    # Console handler (stderr)
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(fmt)
@@ -563,6 +563,9 @@ def extract_one(
         # --- Update annotation with extraction results ---
         from .repo_ops import count_changed_lines
         added, removed = count_changed_lines(extracted.get("solution_patch", ""))
+        extracted["solution_lines"] = added + removed
+        extracted["lines_added"] = added
+        extracted["lines_removed"] = removed
         update_annotation_extraction(conn, event_id, {
             "has_test_changes": 1 if extracted.get("test_patch", "").strip() else 0,
             "has_solution_changes": 1 if extracted.get("solution_patch", "").strip() else 0,
@@ -577,6 +580,7 @@ def extract_one(
         })
 
         # --- Repo quality gate ---
+        quality = None
         try:
             quality = check_repo_quality(
                 repo_name,
@@ -605,6 +609,16 @@ def extract_one(
                 return "skip"
         except Exception:
             log.debug("  Repo quality check failed, continuing anyway")
+
+        # Inject repo quality metadata into extracted dict for task storage
+        if quality is not None:
+            extracted["repo_stars"] = quality.stars
+            extracted["repo_forks"] = quality.forks
+            extracted["repo_contributors"] = quality.contributors
+            extracted["has_ci"] = quality.has_ci
+            extracted["has_test_framework"] = quality.has_test_framework
+            extracted["is_archived"] = quality.is_archived
+            extracted["is_fork"] = quality.is_fork
 
         lang = ann["language"] or "python"
 
@@ -812,16 +826,6 @@ def _phase_store(
     log.info("  File: %s", path)
     log.info("  FAIL_TO_PASS: %d tests, PASS_TO_PASS: %d tests",
              len(task["FAIL_TO_PASS"]), len(task["PASS_TO_PASS"]))
-
-    # Upload to Hippius decentralised storage (fire-and-forget)
-    try:
-        from swe_infinite.hippius import upload_task as hippius_upload
-        if hippius_upload(path):
-            log.info("  Uploaded to Hippius: %s", task["instance_id"])
-        else:
-            log.debug("  Hippius upload skipped (no credentials or not configured)")
-    except Exception:
-        log.warning("  Hippius upload failed (non-fatal)", exc_info=True)
 
     return "task", task
 

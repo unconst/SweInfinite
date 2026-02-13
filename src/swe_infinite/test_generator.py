@@ -12,7 +12,6 @@ Supports: Python, TypeScript/JavaScript, Java, Go.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import subprocess
 import textwrap
@@ -26,65 +25,15 @@ log = logging.getLogger("swe-infinite.test_generator")
 
 
 def _call_llm(prompt: str, max_tokens: int = 4096) -> str | None:
-    """Call an LLM via available backends (Anthropic, OpenAI, agent CLI)."""
-    # Try Anthropic API
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        try:
-            import httpx
+    """Call an LLM via the Cursor agent CLI.
 
-            resp = httpx.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
-                    "max_tokens": max_tokens,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=120,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                try:
-                    return data["content"][0]["text"]
-                except (KeyError, IndexError, TypeError):
-                    log.debug("Anthropic API returned unexpected structure")
-        except Exception as e:
-            log.debug("Anthropic API failed: %s", e)
+    Requires the ``agent`` command to be available on PATH (installed with
+    Cursor IDE).
 
-    # Try OpenAI API
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        try:
-            import httpx
-
-            resp = httpx.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": os.environ.get("OPENAI_MODEL", "gpt-4o"),
-                    "max_tokens": max_tokens,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=120,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                try:
-                    return data["choices"][0]["message"]["content"]
-                except (KeyError, IndexError, TypeError):
-                    log.debug("OpenAI API returned unexpected structure")
-        except Exception as e:
-            log.debug("OpenAI API failed: %s", e)
-
-    # Fallback: Cursor agent CLI
+    Args:
+        prompt: The prompt text to send.
+        max_tokens: Unused (kept for call-site compatibility).
+    """
     try:
         result = subprocess.run(
             ["agent", "-p", prompt, "--output-format", "text"],
@@ -94,8 +43,10 @@ def _call_llm(prompt: str, max_tokens: int = 4096) -> str | None:
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    except FileNotFoundError:
+        log.warning("Cursor agent CLI ('agent') not found on PATH – install Cursor IDE first")
+    except subprocess.TimeoutExpired:
+        log.warning("Cursor agent CLI timed out after 120 s")
 
     log.warning("No LLM backend available for test generation")
     return None

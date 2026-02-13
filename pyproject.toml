@@ -5,7 +5,6 @@ description = "Validated, quality-scored SWE benchmark task factory"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.0",
-    "minio>=7.0.0",
     "orjson>=3.10.0",
 ]
 
@@ -18,8 +17,6 @@ full = [
 [project.scripts]
 swe-infinite = "swe_infinite.cli:main"
 swe-eval = "swe_infinite.cli:eval_main"
-swe-pull = "swe_infinite.cli:pull_main"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

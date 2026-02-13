@@ -1,7 +1,6 @@
 # Data & outputs
 workspace/
 results/
-synth_workdir/
 
 # Database
 *.db
@@ -27,5 +26,3 @@ build/
 
 # System / machine-specific
 .DS_Store
-# Keep com.swe-infinite.plist tracked; ignore other plists
-# *.plist
