@@ -15,10 +15,10 @@ uv pip install -e .
 # Set required environment variables
 export GITHUB_TOKEN=ghp_...
 
-# Run the generator (continuous, fault-tolerant)
+# Run the generator (continuous, fault-tolerant) tasks go to dataset/
 swe-infinite
 
-# Produce one task and exit
+# Produce one task into dataset and exit
 swe-infinite --once
 
 # Check pipeline stats
