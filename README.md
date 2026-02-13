@@ -40,17 +40,6 @@ The process handles errors gracefully and runs indefinitely. Logs go to stderr a
 
 ## Configuration
 
-### Environment Variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `GITHUB_TOKEN` | Recommended | GitHub personal access token. Without it, API rate limit is 60 req/hr vs 5,000. |
-| `ANTHROPIC_API_KEY` | Optional | Enables LLM-based quality scoring via Claude. |
-| `OPENAI_API_KEY` | Optional | Fallback LLM provider for quality scoring. |
-| `HIPPIUS_ACCESS_KEY` | Optional | Hippius S3 access key (starts with `hip_`) for uploading tasks to decentralized storage. |
-| `HIPPIUS_SECRET_KEY` | Optional | Hippius S3 secret key (paired with access key above). |
-| `HIPPIUS_MNEMONIC` | Optional | Legacy Hippius subaccount mnemonic (fallback if access keys not set). |
-
 ### Generator Flags (`swe-infinite`)
 
 | Flag | Default | Description |
@@ -72,23 +61,6 @@ The process handles errors gracefully and runs indefinitely. Logs go to stderr a
 | `--skip-install` | off | Skip dependency installation step. |
 | `--model NAME` | auto | Model for the Cursor agent (e.g. `sonnet-4`, `gpt-5`). |
 | `--cleanup` | off | Remove eval working directories after each task. |
-
-## Evaluation
-
-Evaluate generated tasks using the Cursor agent CLI:
-
-```bash
-# Evaluate all tasks in dataset/
-swe-eval
-
-# Evaluate specific tasks
-swe-eval dataset/owner__repo-42.json
-
-# With options
-swe-eval --agent-timeout 300 --model sonnet-4
-```
-
-Results are written to `results/eval_<timestamp>.json`.
 
 <details>
 <summary>Running as a background service</summary>
@@ -214,6 +186,89 @@ pipeline.db              SQLite database (runtime)
 
 ## Requirements
 
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/)
-- Docker (optional, for isolated validation via `--docker`)
+### System Tools
+
+| Tool | Required | Used For |
+|---|---|---|
+| **Python 3.11+** | Yes | Runtime |
+| **[uv](https://docs.astral.sh/uv/)** | Yes | Virtual environments and package installation (`uv venv`, `uv pip install`) |
+| **[git](https://git-scm.com/)** | Yes | Cloning repos, computing diffs, checking out commits, reading tags |
+| **[Cursor](https://www.cursor.com/)** (provides the `agent` CLI) | Yes | Install recipe generation, evaluation harness, LLM-driven code tasks. Install Cursor IDE, then the `agent` command is available on your PATH. |
+| **[Docker](https://www.docker.com/)** | Optional | Isolated validation environments (enable with `--docker`) |
+
+### Language-Specific Tools (for multi-language validation)
+
+The pipeline validates tasks by running test suites. Depending on which languages you process, you need the corresponding toolchains installed:
+
+| Language | Tools Needed |
+|---|---|
+| **Python** | `python3`, `pytest` (installed automatically into venvs) |
+| **JavaScript/TypeScript** | `node`, and one of: `npm`, `yarn`, `pnpm`, or `bun`; test runners like `jest` are project-local |
+| **Java** | `mvn` (Maven) or `gradle` / `./gradlew` |
+| **Go** | `go` |
+
+By default all supported languages are enabled. Use `--languages python` (or any comma-separated subset) to restrict to only the languages you have tooling for.
+
+### API Keys / Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `GITHUB_TOKEN` | **Recommended** | GitHub personal access token. Without it the API rate limit is 60 req/hr vs 5,000. |
+| `OPENAI_API_KEY` | **Yes (or Anthropic)** | LLM provider for quality scoring, synthetic problem statements, and install recipes. |
+| `ANTHROPIC_API_KEY` | **Yes (or OpenAI)** | Alternative LLM provider via Claude. Pipeline tries Anthropic first, falls back to OpenAI. Set at least one. |
+| `ANTHROPIC_MODEL` | Optional | Override the default Anthropic model (e.g. `claude-sonnet-4-20250514`). |
+| `OPENAI_MODEL` | Optional | Override the default OpenAI model (e.g. `gpt-4o`). |
+| `HIPPIUS_ACCESS_KEY` | Optional | Hippius S3 access key for uploading tasks to decentralized storage. |
+| `HIPPIUS_SECRET_KEY` | Optional | Hippius S3 secret key (paired with access key above). |
+| `HIPPIUS_MNEMONIC` | Optional | Legacy Hippius subaccount mnemonic (fallback if access keys not set). |
+
+> **LLM keys are needed for the full pipeline.** Without `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, quality scoring falls back to heuristics and synthetic problem statement generation (for PRs with no linked issue) is disabled.
+
+## Running the Full Pipeline
+
+Make sure all required tools are installed, then:
+
+```bash
+# 1. Install the package
+source .venv/bin/activate
+uv pip install -e .
+
+# 2. Export your keys
+export GITHUB_TOKEN="ghp_..."
+export OPENAI_API_KEY="sk-..."          # or ANTHROPIC_API_KEY
+
+# 3. Run continuously (generates tasks forever, Ctrl-C to stop)
+swe-infinite
+```
+
+### Common Invocations
+
+```bash
+# Full pipeline, continuous, with synthetic problem statements (default)
+GITHUB_TOKEN=ghp_... OPENAI_API_KEY=sk-... swe-infinite
+
+# Generate one task and exit
+GITHUB_TOKEN=ghp_... OPENAI_API_KEY=sk-... swe-infinite --once
+
+# Python-only, Docker isolation, 10+ stars
+swe-infinite --languages python --docker --min-stars 10
+
+# Skip LLM scoring (heuristic fallback, no synthetic bug reports)
+swe-infinite --skip-quality --no-allow-no-issue
+
+# Reject PRs without linked issues (real bug reports only)
+swe-infinite --no-allow-no-issue
+
+# Check pipeline statistics
+swe-infinite --status
+```
+
+### Evaluation (requires Cursor agent CLI)
+
+```bash
+# Evaluate all tasks in dataset/
+swe-eval
+
+# Evaluate specific tasks with options
+swe-eval dataset/owner__repo-42.json --agent-timeout 300 --model sonnet-4
+```
