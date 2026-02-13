@@ -117,10 +117,24 @@ def ensure_bucket(client, bucket: str = DEFAULT_BUCKET) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _object_exists(client, bucket: str, object_name: str) -> bool:
+    """Return ``True`` if *object_name* already exists in *bucket*."""
+    try:
+        client.stat_object(bucket, object_name)
+        return True
+    except Exception:
+        # stat_object raises an error (S3Error with code NoSuchKey) when
+        # the object does not exist.  Treat any exception as "not found"
+        # so the caller can proceed with the upload.
+        return False
+
+
 def upload_task(task_path: Path, bucket: str = DEFAULT_BUCKET) -> bool:
     """Upload a single task JSON file to the Hippius bucket.
 
     The object key is ``tasks/{filename}``.
+    If the exact object already exists in the bucket the upload is skipped
+    and the function returns ``True`` (success, no duplicate created).
     Returns ``True`` on success, ``False`` on any error (including missing
     credentials).
     """
@@ -132,6 +146,11 @@ def upload_task(task_path: Path, bucket: str = DEFAULT_BUCKET) -> bool:
         return False
 
     object_name = f"tasks/{task_path.name}"
+
+    # --- Deduplication check ---
+    if _object_exists(client, bucket, object_name):
+        log.info("Task already exists in bucket, skipping upload: s3://%s/%s", bucket, object_name)
+        return True
 
     try:
         data = task_path.read_bytes()

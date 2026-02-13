@@ -92,11 +92,12 @@ class FilterConfig:
     require_ci: bool = False
     require_tests: bool = True
     allow_archived: bool = False
-    allow_non_permissive: bool = False
+    allow_non_permissive: bool = True
     languages: set[str] = field(default_factory=lambda: set(SUPPORTED_LANGUAGES))
 
     # --- issue / PR filters ---
     min_issue_length: int = 10
+    allow_no_issue: bool = True
 
     # --- patch filters ---
     max_patch_files: int = 15
@@ -107,6 +108,9 @@ class FilterConfig:
     min_quality_score: int = 2
     skip_quality: bool = False
     skip_decontamination: bool = False
+
+    # --- test generation ---
+    generate_tests: bool = False
 
     # --- validation ---
     skip_validation: bool = False
@@ -290,7 +294,10 @@ _ISSUE_RE_URL = re.compile(
 
 
 def _find_linked_issue(title: str, body: str) -> int | None:
-    """Find a single linked issue number from PR title+body. Returns None if 0 or >1.
+    """Find a linked issue number from PR title+body. Returns None if 0 found.
+
+    When multiple issues are linked at the same priority level, returns the
+    lowest-numbered one (typically the primary issue).
 
     Checks in priority order: strong keywords (fix/close/resolve), medium keywords
     (addresses/refs/related), then bare GitHub issue URLs.
@@ -306,8 +313,8 @@ def _find_linked_issue(title: str, body: str) -> int | None:
                     num = m.group(1) or m.group(2)
                 if num:
                     issues.add(int(num))
-        if len(issues) == 1:
-            return issues.pop()
+        if issues:
+            return min(issues)  # pick lowest-numbered (primary) issue
     return None
 
 
@@ -316,11 +323,16 @@ def _find_linked_issue(title: str, body: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-def annotate_one(conn: sqlite3.Connection) -> str:
+def annotate_one(conn: sqlite3.Connection, *, allow_no_issue: bool = False) -> str:
     """Pick one un-enriched merged PR, enrich it, and store all metadata.
 
     This is FAST — only API calls, no git cloning.
     Every enriched PR gets a row in pr_annotations regardless of viability.
+
+    Args:
+        allow_no_issue: When True, PRs without a linked issue can still be
+            marked as quality_ok if their PR body passes heuristic checks.
+            A problem statement will be generated from the PR diff later.
 
     Returns: "annotated", "skip" (API error), or "empty" (no PRs left).
     """
@@ -394,6 +406,16 @@ def annotate_one(conn: sqlite3.Connection) -> str:
             issue_quality_reason = rejection
         else:
             issue_quality_ok = 1
+    elif allow_no_issue and issue_num is None:
+        # No linked issue — check if PR body itself is usable as a problem source.
+        # The actual problem statement will be generated via LLM during extraction.
+        pr_body_text = enriched.get("body") or ""
+        pr_title_text = enriched.get("title") or ""
+        if len(pr_body_text.strip()) > 20 or len(pr_title_text.strip()) > 10:
+            issue_quality_ok = 1
+            issue_quality_reason = "no-issue: PR body used as problem source"
+        else:
+            issue_quality_reason = "no-issue: PR body too short for problem generation"
 
     # --- Store annotation (NOTHING is filtered out) ---
     ann = {
@@ -452,6 +474,7 @@ def extract_one(
             languages=filters.languages,
             min_issue_length=filters.min_issue_length,
             limit=1,
+            allow_no_issue=filters.allow_no_issue,
         )
 
         if not candidates:
@@ -492,6 +515,7 @@ def extract_one(
                 max_patch_files=filters.max_patch_files,
                 min_patch_lines=filters.min_patch_lines,
                 max_patch_lines=filters.max_patch_lines,
+                generate_tests=filters.generate_tests,
             )
         except Exception as exc:
             log.exception("  Error extracting %s PR#%d", repo_name, pr_number)
@@ -594,6 +618,20 @@ def extract_one(
         log.info("  Install recipe: python=%s, install=%s",
                  install_config.get("python", "?"),
                  install_config.get("install", "?")[:60])
+
+        # --- Generate problem statement if no issue body ---
+        issue_body = (extracted.get("issue_body") or "").strip()
+        if filters.allow_no_issue and len(issue_body) < 20:
+            from .quality_scorer import generate_problem_statement
+            generated = generate_problem_statement(
+                pr_title=extracted.get("pr_title") or ann.get("pr_title") or "",
+                pr_body=ann.get("pr_body") or "",
+                solution_patch=extracted.get("solution_patch") or "",
+            )
+            if generated:
+                extracted["issue_title"] = generated.split("\n")[0][:200]
+                extracted["issue_body"] = generated
+                log.info("  Generated problem statement (%d chars) from PR diff", len(generated))
 
         task = build_task_instance(
             extracted, version=version, install_config=install_config,
@@ -787,7 +825,7 @@ def process_one(
     conn = get_connection(db_path)
     try:
         # Phase A: annotate next un-enriched PR (fast)
-        status = annotate_one(conn)
+        status = annotate_one(conn, allow_no_issue=filters.allow_no_issue)
         if status == "annotated":
             return "annotated"
         # If "empty" or "skip", fall through to try extraction
@@ -1056,6 +1094,10 @@ def main() -> None:
         "--docker", action="store_true",
         help="Use Docker for isolated validation environments",
     )
+    phase_group.add_argument(
+        "--generate-tests", action="store_true",
+        help="Generate tests via LLM for PRs that have no test changes in the diff",
+    )
 
     # --- Repo filters ---
     repo_group = parser.add_argument_group("repo filters")
@@ -1080,8 +1122,8 @@ def main() -> None:
         help="Include archived repositories (default: skip them)",
     )
     repo_group.add_argument(
-        "--allow-non-permissive", action="store_true",
-        help="Include repos with non-permissive or unknown licenses",
+        "--no-allow-non-permissive", action="store_true",
+        help="Reject repos with non-permissive licenses (default: allow all licenses)",
     )
     repo_group.add_argument(
         "--languages", type=str, default=None,
@@ -1093,6 +1135,10 @@ def main() -> None:
     issue_group.add_argument(
         "--min-issue-length", type=int, default=10,
         help="Minimum issue body length in characters (default: 10)",
+    )
+    issue_group.add_argument(
+        "--no-allow-no-issue", action="store_true",
+        help="Reject PRs with no linked issue (default: accept them and generate problem statement via LLM)",
     )
 
     # --- Patch filters ---
@@ -1137,13 +1183,15 @@ def main() -> None:
         require_ci=args.require_ci,
         require_tests=not args.no_require_tests,
         allow_archived=args.allow_archived,
-        allow_non_permissive=args.allow_non_permissive,
+        allow_non_permissive=not args.no_allow_non_permissive,
         languages=languages,
         min_issue_length=args.min_issue_length,
+        allow_no_issue=not args.no_allow_no_issue,
         max_patch_files=args.max_patch_files,
         min_patch_lines=args.min_patch_lines,
         max_patch_lines=args.max_patch_lines,
         min_quality_score=args.min_quality_score,
+        generate_tests=args.generate_tests,
         skip_quality=args.skip_quality,
         skip_decontamination=args.skip_decontamination,
         skip_validation=args.skip_validation,
@@ -1170,7 +1218,10 @@ def main() -> None:
     # 1. ANNOTATE: enrich PRs rapidly (API-only, no cloning)
     # 2. EXTRACT: pick best annotated candidate and do expensive work
 
-    ANNOTATION_BATCH = 20  # annotate this many before trying extraction
+    # When allow_no_issue is on, most PRs are immediately viable so we
+    # annotate just one before trying extraction.  With the strict filter
+    # we still batch to build up a pool of candidates.
+    ANNOTATION_BATCH = 1 if filter_config.allow_no_issue else 20
 
     while not _shutdown:
         # --- Periodic heartbeat (every 10 min) ---
@@ -1197,7 +1248,7 @@ def main() -> None:
                 if _shutdown:
                     break
                 try:
-                    status = annotate_one(conn)
+                    status = annotate_one(conn, allow_no_issue=filter_config.allow_no_issue)
                 except Exception:
                     log.exception("Error during annotation")
                     errors += 1

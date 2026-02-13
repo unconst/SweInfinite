@@ -391,6 +391,34 @@ def is_permissive_license(license_name: str | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Language detection from patch
+# ---------------------------------------------------------------------------
+
+_LANG_BY_EXTENSION = {
+    ".py": "python",
+    ".ts": "typescript", ".tsx": "typescript",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
+    ".java": "java",
+    ".go": "go",
+}
+
+
+def _detect_language_from_patch(patch: str) -> str:
+    """Detect the primary programming language from file extensions in a patch."""
+    file_paths = re.findall(r"^diff --git a/.+? b/(.+?)$", patch, re.MULTILINE)
+    lang_counts: dict[str, int] = {}
+    for fpath in file_paths:
+        ext = Path(fpath).suffix.lower()
+        lang = _LANG_BY_EXTENSION.get(ext)
+        if lang:
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
+
+    if not lang_counts:
+        return "python"  # default fallback
+    return max(lang_counts, key=lang_counts.get)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
 # High-level: extract a task from a candidate
 # ---------------------------------------------------------------------------
 
@@ -402,6 +430,7 @@ def extract_candidate(
     max_patch_files: int = 15,
     min_patch_lines: int = 3,
     max_patch_lines: int = 1000,
+    generate_tests: bool = False,
 ) -> dict | None:
     """Process a single candidate into extracted task data.
 
@@ -414,6 +443,7 @@ def extract_candidate(
         max_patch_files: Maximum files allowed in the solution patch.
         min_patch_lines: Minimum changed lines for patch complexity check.
         max_patch_lines: Maximum changed lines for patch complexity check.
+        generate_tests: If True, use LLM to generate tests when PR has no test changes.
 
     Returns a dict with extracted fields or None if the candidate fails validation.
     """
@@ -446,13 +476,57 @@ def extract_candidate(
     # 4. Split patches
     solution_patch, test_patch = split_patch(full_diff)
 
-    # Must have BOTH solution and test changes
+    # Must have solution changes
     if not solution_patch.strip():
         log.info("Skipping %s PR#%s — no non-test changes", repo_name, candidate["pr_number"])
         return None
+
+    # If no test changes, optionally generate tests via LLM
     if not test_patch.strip():
-        log.info("Skipping %s PR#%s — no test changes", repo_name, candidate["pr_number"])
-        return None
+        if not generate_tests:
+            log.info("Skipping %s PR#%s — no test changes", repo_name, candidate["pr_number"])
+            return None
+
+        # Generate tests using LLM
+        log.info("No test changes in %s PR#%s — generating tests via LLM...",
+                 repo_name, candidate["pr_number"])
+        try:
+            from .test_generator import generate_test_patch
+
+            # Determine language from candidate metadata or file extensions
+            language = _detect_language_from_patch(solution_patch)
+
+            # Temporarily apply the solution to read fixed source files
+            target = head_sha or merge_sha
+            _run_git(["checkout", target, "--force"], cwd=repo_dir, timeout=120)
+
+            generated_patch = generate_test_patch(
+                repo_dir=repo_dir,
+                solution_patch=solution_patch,
+                language=language,
+                repo_name=repo_name,
+                pr_title=candidate.get("pr_title", ""),
+                pr_body=candidate.get("issue_body", ""),
+            )
+
+            # Restore to base commit for downstream processing
+            _run_git(["checkout", base_sha, "--force"], cwd=repo_dir, timeout=120)
+
+            if generated_patch:
+                test_patch = generated_patch
+                log.info("  Generated test patch for %s PR#%s (%d chars)",
+                         repo_name, candidate["pr_number"], len(test_patch))
+            else:
+                log.info("Skipping %s PR#%s — test generation failed",
+                         repo_name, candidate["pr_number"])
+                return None
+
+        except Exception as exc:
+            log.warning("Skipping %s PR#%s — test generation error: %s",
+                        repo_name, candidate["pr_number"], exc)
+            # Restore to base commit on error
+            _run_git(["checkout", base_sha, "--force"], cwd=repo_dir, timeout=120)
+            return None
 
     # 5. File count check
     file_count = count_files_in_patch(solution_patch)

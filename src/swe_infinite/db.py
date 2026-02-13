@@ -248,22 +248,36 @@ def get_extractable_annotations(
     languages: set[str] | None = None,
     min_issue_length: int = 10,
     limit: int = 1,
+    allow_no_issue: bool = False,
 ) -> list[dict]:
     """Return annotated PRs that look viable for extraction.
 
     Picks candidates that:
-    - Have a linked issue with sufficient body length
+    - Have a linked issue with sufficient body length (or, when
+      allow_no_issue is True, have a PR body usable as problem source)
     - Are in a supported language
     - Haven't been extracted yet
     - Passed the heuristic issue quality check
     """
-    sql = """
-        SELECT * FROM pr_annotations
-        WHERE status = 'annotated'
-          AND issue_num IS NOT NULL
-          AND issue_body_len > ?
-          AND issue_quality_ok = 1
-    """
+    if allow_no_issue:
+        # Accept PRs with a linked issue OR those with a usable PR body
+        sql = """
+            SELECT * FROM pr_annotations
+            WHERE status = 'annotated'
+              AND issue_quality_ok = 1
+              AND (
+                  (issue_num IS NOT NULL AND issue_body_len > ?)
+                  OR (issue_num IS NULL AND pr_body IS NOT NULL AND length(pr_body) > 20)
+              )
+        """
+    else:
+        sql = """
+            SELECT * FROM pr_annotations
+            WHERE status = 'annotated'
+              AND issue_num IS NOT NULL
+              AND issue_body_len > ?
+              AND issue_quality_ok = 1
+        """
     params: list = [min_issue_length]
 
     if languages:
@@ -303,10 +317,14 @@ def get_annotation_stats(conn: sqlite3.Connection) -> dict:
         ).fetchone()
         stats["with_issue"] = row["cnt"]
 
-        # Extraction-ready (have issue, right language, quality OK)
+        # Extraction-ready (have issue OR usable PR body, right language, quality OK)
         row = conn.execute(
             """SELECT COUNT(*) AS cnt FROM pr_annotations
-               WHERE issue_num IS NOT NULL AND issue_quality_ok = 1 AND issue_body_len > 10"""
+               WHERE issue_quality_ok = 1
+                 AND (
+                     (issue_num IS NOT NULL AND issue_body_len > 10)
+                     OR (issue_num IS NULL AND pr_body IS NOT NULL AND length(pr_body) > 20)
+                 )"""
         ).fetchone()
         stats["extraction_ready"] = row["cnt"]
 

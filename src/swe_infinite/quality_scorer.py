@@ -86,8 +86,8 @@ _SKIP_TITLE_PATTERNS = [
     re.compile(r"\bbump\b", re.IGNORECASE),
     re.compile(r"\bdeps?\b", re.IGNORECASE),
     re.compile(r"\bchore\b", re.IGNORECASE),
-    re.compile(r"\bci\b", re.IGNORECASE),
-    re.compile(r"\bdocs?\b", re.IGNORECASE),
+    # Only match standalone CI prefixes like "[CI]" or "CI:" — not words containing "ci"
+    re.compile(r"(?:^|\[)\s*ci\s*[\]:]", re.IGNORECASE),
     re.compile(r"\btypo\b", re.IGNORECASE),
     re.compile(r"\bformat(?:ting)?\b", re.IGNORECASE),
     re.compile(r"\blint(?:ing)?\b", re.IGNORECASE),
@@ -109,7 +109,7 @@ def heuristic_issue_prefilter(title: str, body: str) -> str | None:
             return f"Title matches skip pattern: {pat.pattern}"
 
     # Body too short
-    if len(body.strip()) < 20:
+    if len(body.strip()) < 10:
         return f"Body too short ({len(body.strip())} chars)"
 
     # Remove code blocks to measure actual prose
@@ -169,11 +169,14 @@ def heuristic_patch_quality(solution_patch: str, test_patch: str) -> str | None:
         if comment_lines / max(len(added), 1) > 0.9:
             return "Solution patch appears to only modify comments/docstrings"
 
-    # Check test patch has actual assertions
+    # Check test patch has actual assertions (covers multiple test frameworks)
     test_added = [l[1:] for l in test_patch.split("\n") if l.startswith("+") and not l.startswith("+++")]
     has_assert = any("assert" in l.lower() for l in test_added)
     has_pytest_raises = any("pytest.raises" in l or "raises(" in l for l in test_added)
-    if not has_assert and not has_pytest_raises:
+    has_expect = any("expect(" in l or ".toBe(" in l or ".toEqual(" in l for l in test_added)
+    has_should = any(".should" in l for l in test_added)
+    has_junit = any("assertThat(" in l or "verify(" in l for l in test_added)
+    if not (has_assert or has_pytest_raises or has_expect or has_should or has_junit):
         return "Test patch appears to have no assertions"
 
     return None
@@ -415,6 +418,66 @@ def _extract_json_from_text(text: str) -> dict | None:
             continue
 
     return None
+
+
+_GENERATE_PROBLEM_PROMPT = """\
+You are analyzing a merged pull request to write a bug report / problem statement.
+Given the PR metadata and diff below, write a clear problem statement describing
+what was wrong BEFORE this fix was applied. Write it as if you are filing a bug
+report -- describe the symptoms, not the solution.
+
+## PR Title
+{pr_title}
+
+## PR Body
+{pr_body}
+
+## Diff (solution patch)
+{solution_patch}
+
+Write a concise problem statement (2-6 sentences). Describe:
+- What component/function is affected
+- What the incorrect behavior is
+- Expected vs actual behavior if inferable
+
+Do NOT reveal the solution or mention the PR. Write as a standalone bug report.
+"""
+
+
+def generate_problem_statement(
+    pr_title: str,
+    pr_body: str,
+    solution_patch: str,
+) -> str:
+    """Synthesize a problem statement from PR metadata and diff using an LLM.
+
+    When a PR has no linked issue (or the issue body is too short), we can
+    still create a useful problem statement by having an LLM read the diff
+    and describe what was broken.
+
+    Falls back to "PR title + PR body" if LLM is unavailable.
+    """
+    pr_title = pr_title or ""
+    pr_body = pr_body or ""
+    solution_patch = solution_patch or ""
+
+    prompt = _GENERATE_PROBLEM_PROMPT.format(
+        pr_title=pr_title[:500],
+        pr_body=pr_body[:2000],
+        solution_patch=_truncate_patch(solution_patch),
+    )
+
+    output = _call_llm(prompt)
+    if output and len(output.strip()) > 20:
+        log.info("  [quality] Generated problem statement via LLM (%d chars)", len(output.strip()))
+        return output.strip()
+
+    # Fallback: compose from PR title + body
+    log.debug("  [quality] LLM unavailable for problem generation, using PR title+body")
+    fallback = pr_title
+    if pr_body.strip():
+        fallback += "\n\n" + pr_body.strip()
+    return fallback
 
 
 def score_with_llm(
