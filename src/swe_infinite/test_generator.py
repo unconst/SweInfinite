@@ -24,7 +24,7 @@ log = logging.getLogger("swe-infinite.test_generator")
 # ---------------------------------------------------------------------------
 
 
-def _call_llm(prompt: str, max_tokens: int = 4096) -> str | None:
+def _call_llm(prompt: str, max_tokens: int = 4096, cwd: Path | None = None) -> str | None:
     """Call an LLM via the Cursor agent CLI.
 
     Requires the ``agent`` command to be available on PATH (installed with
@@ -33,13 +33,20 @@ def _call_llm(prompt: str, max_tokens: int = 4096) -> str | None:
     Args:
         prompt: The prompt text to send.
         max_tokens: Unused (kept for call-site compatibility).
+        cwd: Working directory for the agent process. When provided, also
+            passed as ``--workspace`` so any files the agent creates land
+            inside that directory instead of the project root.
     """
     try:
+        cmd = ["agent", "-p", prompt, "--output-format", "text"]
+        if cwd is not None:
+            cmd.extend(["--workspace", str(cwd)])
         result = subprocess.run(
-            ["agent", "-p", prompt, "--output-format", "text"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=120,
+            cwd=cwd,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout
@@ -392,7 +399,7 @@ def generate_test_patch(
         log.info("  [test-gen] Generating test (attempt %d/%d) for %s...",
                  attempt, max_retries, language)
 
-        response = _call_llm(prompt)
+        response = _call_llm(prompt, cwd=repo_dir)
         if not response:
             log.warning("  [test-gen] LLM returned no response (attempt %d)", attempt)
             continue

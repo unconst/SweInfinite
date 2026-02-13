@@ -33,6 +33,9 @@ VALIDATION_DIR = WORKSPACE_DIR / "validation"
 #: Decontamination index cache.
 DECONTAMINATION_CACHE_DIR = WORKSPACE_DIR / "decontamination_cache"
 
+#: Scratch directory for text-only LLM agent calls (sandboxes file side-effects).
+LLM_SCRATCH_DIR = WORKSPACE_DIR / "llm_scratch"
+
 #: SQLite database.
 DEFAULT_DB_PATH = PROJECT_ROOT / "pipeline.db"
 

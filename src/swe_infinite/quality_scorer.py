@@ -325,11 +325,21 @@ def _call_llm(prompt: str) -> str | None:
 
     Requires the ``agent`` command to be available on PATH (installed with
     Cursor IDE).
+
+    Uses a scratch directory as ``--workspace`` and ``cwd`` so that any files
+    the agent creates as a side-effect land there instead of the project root.
     """
+    from .paths import LLM_SCRATCH_DIR
+
+    scratch = LLM_SCRATCH_DIR
+    scratch.mkdir(parents=True, exist_ok=True)
+
     try:
         result = subprocess.run(
-            ["agent", "-p", prompt, "--output-format", "text"],
+            ["agent", "-p", prompt, "--output-format", "text",
+             "--workspace", str(scratch)],
             capture_output=True, text=True, timeout=60,
+            cwd=scratch,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout

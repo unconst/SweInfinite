@@ -172,6 +172,7 @@ def _run_agent(prompt: str, workspace: Path, timeout: int = 300) -> str | None:
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=workspace,
         )
         if result.returncode != 0:
             log.warning("agent exited %d", result.returncode)
